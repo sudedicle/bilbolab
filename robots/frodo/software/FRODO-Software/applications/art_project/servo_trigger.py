@@ -55,6 +55,7 @@ class ArucoServoTrigger:
         self._last_trigger_time = -1e9
 
         if init_home:
+
             self.servo.setAngle(self.angle_home, settle_time=self.settle_time)
 
     # ---------------- fine-grained API (does not interrupt frame-by-frame ArUco scanning) ----------------

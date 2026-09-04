@@ -31,12 +31,12 @@ SERVO_PIN = 19                 # BCM GPIO19 - verified with the servo_pin_scan.p
 SERVO_ANGLE_HOME = 0
 SERVO_ANGLE_TRIGGER = 90
 SERVO_TRIGGER_IDS = {999, 998, 997, 996, 995}  # seeing one of these IDs triggers the servo action
-SERVO_FORWARD_DURATION = 1.0   # seconds - drive straight this long after the servo turns, then rotate_to_home()
+SERVO_FORWARD_DURATION = 1.5   # seconds - drive straight this long after the servo turns, then rotate_to_home()
 SERVO_RETRIGGER_COOLDOWN = 5.0 # so passing the same marker doesn't retrigger it over and over
 # When a marker is first seen, the robot is not yet lined up with it (the camera
 # sees it ahead of time) - close this distance open-loop (without looking at the
 # image) before triggering the servo. Measure in the field and adjust as needed.
-SERVO_TRIGGER_APPROACH_DISTANCE_M = 0.16
+SERVO_TRIGGER_APPROACH_DISTANCE_M = 0.2
 
 # --- ARUCO FILTERS ---
 # The DECISION (direction/target) is made as soon as a marker is ACCEPTED - but
@@ -200,7 +200,11 @@ class ArtProjectAgent:
         # yet (missing rpi_hardware_pwm or the config.txt PWM overlay) - the grid
         # navigation and ArUco logic still run, the servo just doesn't move.
         try:
+            # self.servo = NullServo()
+            # self.servo = HardwareServo(pin=SERVO_PIN, min_pulse_ms=0.15, max_pulse_ms=2.5)
+
             self.servo = HardwareServo(pin=SERVO_PIN)
+
         except (ImportError, ModuleNotFoundError, FileNotFoundError, OSError) as e:
             frodo.logger.warning(f"HardwareServo unavailable ({e}) - using NullServo (servo will not move)")
             self.servo = NullServo()

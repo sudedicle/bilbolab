@@ -148,7 +148,6 @@ class HardwareServo(_ServoAngleMixin):
         self._current_angle = angle
         if settle_time > 0:
             time.sleep(settle_time)
-
     # ------------------------------------------------------------------------------------------------------------------
     def release(self):
         self._pwm.change_duty_cycle(0)
