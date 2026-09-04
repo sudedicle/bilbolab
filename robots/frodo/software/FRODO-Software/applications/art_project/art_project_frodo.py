@@ -1,6 +1,16 @@
 # =====================================================================================
 #  FRODO - Line Following + ArUco Grid Navigation
-#  Remote-controllable via WiFi commands: goto_grid_node, stop, trigger_servo, get_status
+#
+#  WiFi command surface matches hoca's host-side protocol (see
+#  software/robots/frodo/applications/artproject/application_artproject.py):
+#  go_to_position, stop, get_pose, get_status - names/payloads kept 1:1 compatible so
+#  ArtProject_Application/ArtProject_FRODO on the host can drive this robot unchanged.
+#  trigger_servo is an extra, FRODO-specific command (no host-side equivalent - the
+#  metronome servo also triggers automatically off ArUco IDs, see SERVO_TRIGGER_IDS).
+#
+#  Navigation itself is still grid/line-based (not free x,y driving), so
+#  go_to_position() snaps the requested world (x, y) to the nearest known grid node
+#  and reuses the existing turn-by-turn navigation - see world_to_grid_node() below.
 # =====================================================================================
 import time
 import threading
@@ -13,7 +23,7 @@ from robot.control.frodo_control import FRODO_ControlMode
 from robot.utilities.video_streamer.video_streamer import VideoStreamer
 from core.utils.network import getInterfaceIP
 from hardware.hardware.servo import HardwareServo, NullServo
-from pose_estimator import PoseEstimator, wrap_pi, MARKER_WORLD_MAP
+from pose_estimator import PoseEstimator, wrap_pi, MARKER_WORLD_MAP, GRID_CELL_M
 from line_following import (
     get_color_mask, find_line, calculate_deviation,
     proportional_controller, calculate_wheel_speeds,
@@ -127,6 +137,25 @@ GRID_COLS = 9
 GRID_ROWS = 6
 GRID_NODES = grid_nodes(GRID_COLS, GRID_ROWS)
 
+
+def grid_node_to_world(node: tuple[int, int]) -> tuple[float, float]:
+    """Grid (col, row) -> world (x, y) meters. Same formula as MARKER_WORLD_MAP /
+    CITY_MAP (id -> (id % GRID_COLS, id // GRID_COLS)) - GRID_CELL_M is the real,
+    field-measured spacing between grid nodes (see pose_estimator.py)."""
+    col, row = node
+    return col * GRID_CELL_M, row * GRID_CELL_M
+
+
+def world_to_grid_node(x: float, y: float) -> tuple[int, int]:
+    """World (x, y) meters -> nearest grid node, clamped to the CITY_MAP grid.
+    Used by go_to_position() - hoca's host protocol hands us a world position,
+    but navigation here only knows how to drive to a grid node."""
+    col = int(round(x / GRID_CELL_M))
+    row = int(round(y / GRID_CELL_M))
+    col = max(0, min(GRID_COLS - 1, col))
+    row = max(0, min(GRID_ROWS - 1, row))
+    return col, row
+
 # Body markers per robot (robot/definitions.py -> ARUCO_SETTINGS_*). These are
 # the VERTICAL markers on the robot bodies; they are detected by frodo.sensors
 # (the floor grid has its own separate detector, see aruco_utils.py). Kept in
@@ -154,16 +183,25 @@ OTHER_ROBOT_AHEAD_BEARING = np.radians(45)
 
 
 # =====================================================================================
-class ArtProjectAgent:
+class ArtProject:
     """
     Line-following + ArUco grid-navigation + servo-trigger agent.
 
-    Exposes four WiFi commands so a host PC can remote-control it:
-      - goto_grid_node(x, y): drive to a grid node (async - fire and forget,
-        completion is reported via the 'art_project_arrived' event)
-      - stop(): halt in place and clear any pending target
+    WiFi command surface matches hoca's host protocol (application_artproject.py /
+    ArtProject_FRODO), so ArtProject_Application.plan()+move_robots() can drive this
+    robot as-is:
+      - go_to_position(x, y, psi=None, speed=None, tolerance=None): drive to a world
+        position (meters) - async, snaps to the nearest grid node (see
+        world_to_grid_node() above) and reuses the grid navigation below. Completion/
+        failure is reported via the 'art_project' event ('position_reached' / 'error' /
+        'aborted'), matching the host's ArtProject_FRODO._on_robot_event demux.
+      - stop(): abort the current move, halt in place, fires 'aborted' if a move was active
+      - get_pose(): synchronous {x, y, psi, time} - matches ArtProject_Pose.from_dict
+      - get_status(): synchronous {state, target, pose} (+ FRODO-specific extras)
+
+    Extra, FRODO-specific command (no host-side equivalent):
       - trigger_servo(): manually cycle the metronome servo, independent of position
-      - get_status(): synchronous status query (state, target, pose)
+        (the servo also triggers automatically off ArUco IDs - see SERVO_TRIGGER_IDS)
 
     All hardware access (motors, servo, camera) happens exclusively on the run()
     loop thread. The WiFi-invoked methods above only set/read plain attributes
@@ -181,7 +219,7 @@ class ArtProjectAgent:
 
         # --- shared state (written by WiFi commands, read by run()) ---
         # TEMPORARY for field testing without a host/hub connection - remove once
-        # goto_grid_node() is actually being called over WiFi, this bypasses that
+        # go_to_position() is actually being called over WiFi, this bypasses that
         # entirely and starts the robot heading here immediately.
         self.target_node = (5, 3)         # None = no goal, just keep following the line
         self.stopped = False              # manual halt-in-place, set by stop()
@@ -251,55 +289,95 @@ class ArtProjectAgent:
         wifi = self.frodo.communication.wifi
 
         wifi.newCommand(
-            identifier='goto_grid_node',
-            function=self.goto_grid_node,
-            description='Drive to a grid node (x, y). Async - reports completion via the art_project_arrived event.',
+            identifier='go_to_position',
+            function=self.go_to_position,
+            description='Drive to a world-frame position (meters). Async - reports completion via '
+                        'the art_project event (position_reached/error/aborted).',
             arguments=[
-                CommandArgument(name='x', type=int, description='Target grid X coordinate'),
-                CommandArgument(name='y', type=int, description='Target grid Y coordinate'),
+                CommandArgument(name='x', type=float, description='Target X [m]'),
+                CommandArgument(name='y', type=float, description='Target Y [m]'),
+                CommandArgument(name='psi', type=float, description='Final heading [rad] (accepted, not used yet)',
+                                optional=True, default=None),
+                CommandArgument(name='speed', type=float, description='Speed [m/s] (accepted, not used yet)',
+                                optional=True, default=None),
+                CommandArgument(name='tolerance', type=float, description='Arrival tolerance [m] (accepted, not used yet)',
+                                optional=True, default=None),
             ]
         )
 
         wifi.newCommand(
             identifier='stop',
             function=self.stop,
-            description='Halt in place and clear any pending target.',
+            description='Abort the current move (if any), halt in place, and clear any pending target.',
             arguments=[]
         )
 
         wifi.newCommand(
-            identifier='trigger_servo',
-            function=self.trigger_servo,
-            description='Manually cycle the metronome servo, independent of position (for testing).',
-            arguments=[]
+            identifier='get_pose',
+            function=self.get_pose,
+            description='Return the latest pose estimate as a dict (x, y, psi, time).',
+            arguments=[],
+            execute_in_thread=False,
         )
 
         wifi.newCommand(
             identifier='get_status',
             function=self.get_status,
-            description='Return current state, target node, and pose.',
+            description='Return current state, target, and pose.',
             arguments=[],
             execute_in_thread=False,
         )
 
+        wifi.newCommand(
+            identifier='trigger_servo',
+            function=self.trigger_servo,
+            description='Manually cycle the metronome servo, independent of position (for testing). '
+                        'FRODO-specific - no host-side equivalent.',
+            arguments=[]
+        )
+
     # ------------------------------------------------------------------------------------------------------------------
-    def goto_grid_node(self, x: int, y: int):
-        if (x, y) not in CITY_MAP.values():
-            self.frodo.logger.warning(f"goto_grid_node({x},{y}): not a known CITY_MAP node, proceeding anyway")
+    def go_to_position(self, x: float, y: float, psi: float | None = None,
+                        speed: float | None = None, tolerance: float | None = None) -> dict:
+        """Host-compatible entry point (matches ArtProject.go_to_position on hoca's template).
+        Navigation here is grid/line-based, not free-space - so the requested world (x, y) is
+        snapped to the nearest known grid node and handed to the existing turn-by-turn logic.
+        psi/speed/tolerance are accepted for protocol compatibility but not used yet."""
+        node = world_to_grid_node(x, y)
+        if node not in CITY_MAP.values():
+            self.frodo.logger.warning(f"go_to_position({x:.2f},{y:.2f}) -> nearest node {node} not in CITY_MAP")
         with self._lock:
-            self.target_node = (x, y)
+            self.target_node = node
             self.stopped = False
+        self.frodo.communication.send_event('art_project', {
+            'type': 'move_started',
+            'data': {'target': {'x': x, 'y': y, 'psi': psi, 'speed': speed, 'tolerance': tolerance}},
+        })
+        return {'accepted': True}
 
     # ------------------------------------------------------------------------------------------------------------------
     def stop(self):
         with self._lock:
+            was_moving = self.target_node is not None
             self.stopped = True
             self.target_node = None
+        if was_moving:
+            pose_x, pose_y, pose_psi = self.pose_est.get()
+            self.frodo.communication.send_event('art_project', {
+                'type': 'aborted',
+                'data': {'pose': {'x': float(pose_x), 'y': float(pose_y),
+                                   'psi': float(pose_psi), 'time': time.time()}},
+            })
 
     # ------------------------------------------------------------------------------------------------------------------
     def trigger_servo(self):
         with self._lock:
             self._manual_servo_request = True
+
+    # ------------------------------------------------------------------------------------------------------------------
+    def get_pose(self) -> dict:
+        pose_x, pose_y, pose_psi = self.pose_est.get()
+        return {'x': float(pose_x), 'y': float(pose_y), 'psi': float(pose_psi), 'time': time.time()}
 
     # ------------------------------------------------------------------------------------------------------------------
     def get_status(self) -> dict:
@@ -308,11 +386,17 @@ class ArtProjectAgent:
             target_node = self.target_node
             current_node = self.current_node
         pose_x, pose_y, pose_psi = self.pose_est.get()
+        target = None
+        if target_node is not None:
+            tx, ty = grid_node_to_world(target_node)
+            target = {'x': tx, 'y': ty, 'psi': None, 'speed': None, 'tolerance': None}
         return {
             "state": state,
+            "target": target,
+            "pose": {"x": float(pose_x), "y": float(pose_y), "psi": float(pose_psi), "time": time.time()},
+            # FRODO-specific extras (no host-side equivalent, kept for debugging)
             "target_node": list(target_node) if target_node is not None else None,
             "current_node": list(current_node) if current_node is not None else None,
-            "pose": {"x": float(pose_x), "y": float(pose_y), "psi": float(pose_psi)},
         }
 
     # === STREAMING ====================================================================================================
@@ -446,7 +530,7 @@ class ArtProjectAgent:
         self.pose_est.start()
 
         print("Remote-controllable Grid Navigation Started (ArUco Marker Mode).")
-        print("Waiting for goto_grid_node(x, y) from the host. Press Ctrl+C to stop.\n")
+        print("Waiting for go_to_position(x, y) from the host. Press Ctrl+C to stop.\n")
 
         shape_printed = False
         last_aruco_log = 0.0
@@ -473,7 +557,7 @@ class ArtProjectAgent:
 
                 # ---------------- MANUAL STOP (from the host) ----------------
                 # Aborts whatever it was doing (turn/approach/park included) and holds
-                # in place. goto_grid_node() clears the flag and resumes FOLLOWING.
+                # in place. go_to_position() clears the flag and resumes FOLLOWING.
                 with self._lock:
                     manual_stopped = self.stopped
                 if manual_stopped:
@@ -663,7 +747,7 @@ class ArtProjectAgent:
                         break
 
                     # No target set yet -> nothing to decide, just keep following the
-                    # line (no turns). Waits for the host to call goto_grid_node().
+                    # line (no turns). Waits for the host to call go_to_position().
                     with self._lock:
                         target_node = self.target_node
                     if target_node is None:
@@ -922,7 +1006,7 @@ class ArtProjectAgent:
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
                     if time.time() > stop_timer:
                         frodo.control.setTrackSpeed(0.0, 0.0)
-                        print("\n*** ARRIVED. Resuming line following, waiting for next goto_grid_node(). ***")
+                        print("\n*** ARRIVED. Resuming line following, waiting for next go_to_position(). ***")
                         arrived_node = arriving_node
                         arriving_node = None
                         with self._lock:
@@ -930,10 +1014,20 @@ class ArtProjectAgent:
                             if self.target_node == arrived_node:
                                 self.target_node = None
                         self.state = "FOLLOWING"
-                        self.frodo.communication.send_event(
-                            'art_project_arrived',
-                            {'node': list(arrived_node) if arrived_node is not None else None}
-                        )
+                        arrived_pose_x, arrived_pose_y, arrived_pose_psi = self.pose_est.get()
+                        arrived_target = None
+                        if arrived_node is not None:
+                            ax, ay = grid_node_to_world(arrived_node)
+                            arrived_target = {'x': ax, 'y': ay, 'psi': None, 'speed': None, 'tolerance': None}
+                        self.frodo.communication.send_event('art_project', {
+                            'type': 'position_reached',
+                            'data': {
+                                'pose': {'x': float(arrived_pose_x), 'y': float(arrived_pose_y),
+                                         'psi': float(arrived_pose_psi), 'time': time.time()},
+                                'target': arrived_target,
+                                'node': list(arrived_node) if arrived_node is not None else None,  # FRODO-specific extra
+                            },
+                        })
 
                 # ================= TURNING (closed loop, EKF psi + PI) =================
                 elif self.state in ("TURNING_LEFT", "TURNING_RIGHT"):
@@ -1015,7 +1109,16 @@ class ArtProjectAgent:
                     if turn_start is not None and elapsed > TURN_TIMEOUT:
                         print("!!! TURN TIMEOUT - failed to reach the target angle")
                         STOP_REASON = "TURN_TIMEOUT"
-                        self.frodo.communication.send_event('art_project_error', {'reason': STOP_REASON})
+                        err_pose_x, err_pose_y, err_pose_psi = self.pose_est.get()
+                        self.frodo.communication.send_event('art_project', {
+                            'type': 'error',
+                            'data': {
+                                'type': STOP_REASON,
+                                'message': f"{STOP_REASON}: failed to reach the target heading",
+                                'pose': {'x': float(err_pose_x), 'y': float(err_pose_y),
+                                         'psi': float(err_pose_psi), 'time': time.time()},
+                            },
+                        })
                         self.state = "STOPPED"
                         turn_start = None
 
@@ -1050,7 +1153,7 @@ def main():
     frodo.start()
     frodo.control.setMode(FRODO_ControlMode.EXTERNAL)
 
-    agent = ArtProjectAgent(frodo)
+    agent = ArtProject(frodo)
     agent.run()
 
 
