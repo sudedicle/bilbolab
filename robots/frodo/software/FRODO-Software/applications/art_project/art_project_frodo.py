@@ -470,6 +470,7 @@ class ArtProject:
         first_fix_coord = None     # grid coord of the very first marker seen
         heading_known = False      # True once ROBOT_HEADING has been derived from 2 real fixes
         line_lost_since = None     # FOLLOWING only - see LINE_LOST_CREEP_TIME above
+        line_lost_reported = False # so the one-shot LINE_LOST error event below doesn't spam every frame
 
         # TURNING pivots the robot roughly in place (no forward speed) - it does NOT
         # drive the robot onto the new-color lane by itself. Since the axis color is
@@ -855,6 +856,7 @@ class ArtProject:
 
                     if line_detected:
                         line_lost_since = None
+                        line_lost_reported = False
                         forward_speed, angular_speed = proportional_controller(error, kp, base_speed)
                         v_left, v_right = calculate_wheel_speeds(forward_speed, angular_speed, track_width)
                         frodo.control.setTrackSpeed(v_left, v_right)
@@ -867,6 +869,24 @@ class ArtProject:
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
                     else:
                         frodo.control.setTrackSpeed(0.0, 0.0)
+                        # FOLLOWING, past the creep window, line still not found: no automatic
+                        # recovery beyond this point (needs a human nudge or the line reappearing
+                        # on its own) - report it to the host ONCE (not every frame at ~20 Hz) so
+                        # it's at least visible that the robot stalled, even though we can't fix
+                        # it here.
+                        if self.state == "FOLLOWING" and line_lost_since is not None and not line_lost_reported:
+                            line_lost_reported = True
+                            stuck_pose_x, stuck_pose_y, stuck_pose_psi = self.pose_est.get()
+                            self.frodo.communication.send_event('art_project', {
+                                'type': 'error',
+                                'data': {
+                                    'type': 'LINE_LOST',
+                                    'message': f"Line lost for >{LINE_LOST_CREEP_TIME:.1f}s while "
+                                               f"FOLLOWING - robot stopped, needs manual recovery",
+                                    'pose': {'x': float(stuck_pose_x), 'y': float(stuck_pose_y),
+                                             'psi': float(stuck_pose_psi), 'time': time.time()},
+                                },
+                            })
 
                     if self.state == "APPROACHING":
                         # Only used for the target marker (see the TARGET REACHED

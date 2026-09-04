@@ -1,4 +1,6 @@
 __pycache__
+.venv/
+venv/
 .DS_Store
 *SFConflict*
 .idea

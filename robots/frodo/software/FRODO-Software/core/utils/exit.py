@@ -179,7 +179,12 @@ def _global_exit_handler(signum=None, frame=None):
 # --- Automatic Registration in the Main Thread ---
 if threading.current_thread() == threading.main_thread():
     # Register our global exit handler for SIGINT, SIGTERM, and SIGHUP.
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    # SIGHUP is POSIX-only (no controlling terminal concept on Windows) - signal
+    # module simply doesn't define it there, so guard it instead of hardcoding.
+    _exit_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        _exit_signals.append(signal.SIGHUP)
+    for sig in _exit_signals:
         signal.signal(sig, lambda signum, frame: _global_exit_handler(signum, frame))
 
     # Also register our handler with the atexit module for normal shutdown.
