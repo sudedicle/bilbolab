@@ -99,11 +99,13 @@ APPROACH_TIMEOUT = 5.0     # safety net: stop anyway if the marker never gets bi
 APPROACH_STALL_GRACE = 0.5 # if the line has been lost this long (robot already stopped), call it "arrived" right away
 PARK_TIME_ON_MARKER = 0.4  # short forward settle when we're already on the marker (vs PARKING_TIME from farther out)
 
-# FOLLOWING with the line present but NO accepted marker for this long => the robot
-# has drifted off the grid or overshot its target with nothing to stop it (seen in
-# the field: drove straight into a wall past the target). ~3 cells at base_speed -
-# comfortably longer than a turn sequence + one cell so it won't false-fire.
-MARKER_TIMEOUT_S = 12.0
+# Navigating with a target but NO accepted marker after driving this far since the
+# last one => drifted off the grid / overshot with nothing to stop it (seen in the
+# field: drove into a wall past the target). Distance-based, not time-based, so it
+# does NOT false-fire on a robot that is merely slow to reach the next marker -
+# ~2.5 grid cells (GRID_CELL_M = 0.286).
+MARKER_LOST_DIST_M = 0.75
+MARKER_TIMEOUT_S = 30.0   # backstop for a robot stuck not moving and seeing nothing
 
 # In FOLLOWING (a plain pass-through node, not the final target), a hard stop
 # the instant the line is lost can permanently strand the robot: an ArUco card
@@ -684,7 +686,8 @@ class ArtProject:
         approach_target_id = None     # CITY_MAP id of the marker we're closing on
         approach_target_size = 0      # its latest pixel size
         arriving_node = None          # the grid node we're APPROACHING/PARKING toward
-        last_accepted_marker_time = None   # for MARKER_TIMEOUT_S (drifted-off-grid guard)
+        last_accepted_marker_time = None   # for the drifted/blind guard below
+        path_len_at_last_marker = 0.0      # pose_est.path_length when we last got a fix
         arrived_node = None          # the grid node we finished a mission at (see DONE)
 
         # ADVANCING_TO_TURN: a turn decision was made, the robot keeps driving straight
@@ -882,6 +885,7 @@ class ArtProject:
                     # straight (observed in the field: spins in place near markers).
                     current_coord = CITY_MAP[detected_id]
                     last_accepted_marker_time = now
+                    path_len_at_last_marker = self.pose_est.path_length
                     if detected_id != LAST_SEEN_ID:
                         LAST_SEEN_ID = detected_id
                         self.current_node = current_coord
@@ -1120,30 +1124,35 @@ class ArtProject:
                             pre_turn_start = now
                             turned_since_prev_node = True   # skip re-sync at the next node (this turn is intentional)
                             last_accepted_marker_time = now  # restart the "lost" clock for the post-turn leg
+                            path_len_at_last_marker = self.pose_est.path_length
                             self.state = "ADVANCING_TO_TURN"
 
                     break
 
                 # ---------------- DRIFTED / OVERSHOT GUARD ----------------
-                # FOLLOWING with a target, heading known, line present, but no
-                # accepted marker for MARKER_TIMEOUT_S -> we've left the grid or
-                # driven past the target with nothing to stop us. Halt and report.
+                # Navigating with a target, heading known, but no accepted marker
+                # after driving MARKER_LOST_DIST_M since the last one (or stuck and
+                # blind for MARKER_TIMEOUT_S) -> we've left the grid / overshot with
+                # nothing to stop us, OR the camera simply can't read the markers.
                 if (self.state in ("FOLLOWING", "APPROACHING") and heading_known
-                        and last_accepted_marker_time is not None
-                        and (now - last_accepted_marker_time) > MARKER_TIMEOUT_S):
+                        and last_accepted_marker_time is not None):
                     with self._lock:
                         _tgt = self.target_node
-                    if _tgt is not None:
-                        print(f"!!! No marker for {now - last_accepted_marker_time:.1f}s while navigating "
-                              f"to {_tgt} - lost / overshot.")
+                    _dist_since = self.pose_est.path_length - path_len_at_last_marker
+                    _blind_time = now - last_accepted_marker_time
+                    if _tgt is not None and (_dist_since > MARKER_LOST_DIST_M
+                                             or _blind_time > MARKER_TIMEOUT_S):
+                        print(f"!!! No marker for {_dist_since:.2f} m / {_blind_time:.1f}s while navigating "
+                              f"to {_tgt} - lost, or the camera can't read the markers.")
                         frodo.control.setTrackSpeed(0.0, 0.0)
                         gx, gy, gpsi = self.pose_est.get()
                         self.frodo.communication.send_event('art_project', {
                             'type': 'error',
-                            'data': {'type': 'LOST', 'message': 'no marker seen for too long - lost or overshot',
+                            'data': {'type': 'LOST',
+                                     'message': f'no marker for {_dist_since:.2f} m - lost / overshot / bad detection',
                                      'pose': {'x': float(gx), 'y': float(gy), 'psi': float(gpsi), 'time': time.time()}},
                         })
-                        STOP_REASON = "LOST"
+                        STOP_REASON = "NO MARKERS"
                         self.state = "STOPPED"
 
                 # ================= LINE FOLLOWING =================
