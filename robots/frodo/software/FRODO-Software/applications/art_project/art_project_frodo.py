@@ -131,7 +131,14 @@ ARUCO_LOG_PERIOD = 0.5     # log a marker at most twice per second
 # commanded 90deg came out ~85deg (RADIUS calibration still undershoots a
 # bit), so we command more than a true right angle to compensate. Re-measure
 # with a protractor/compass after changing this and adjust again if needed.
-TURN_ANGLE = np.radians(105.0)   # commanded relative turn per grid turn
+TURN_ANGLE = np.radians(96.0)   # commanded relative turn per grid turn (was 105 - frodo1
+                                # over-rotated ~108deg and left the new line behind it)
+# Per-robot TURN_ANGLE override (deg). 2026-09-08: frodo1 (kp=2.2 gains + good RADIUS
+# calibration) physically rotated ~108deg on a 105deg command, i.e. it tracks the
+# command closely - so give it a near-true right angle.
+TURN_ANGLE_OVERRIDES_DEG = {
+    "frodo1": 92.0,
+}
 TURN_KP = 1.6               # rad/s per rad of error - bumped up, turn was too gentle and lost the line
 TURN_KI = 0.4                # integral gain - overcomes friction/static error
 TURN_I_LIMIT = 0.5           # clamp on the integral term's contribution (rad/s)
@@ -160,11 +167,13 @@ TURN_GAIN_OVERRIDES = {
 # there's no risk of intersection/marker contours steering line-following the
 # wrong way (the old design used line-following here and that caused a "two-step"
 # wobble).
-ADVANCE_TIME = 1.0   # seconds
-ADVANCE_TIME_BOUNDARY = 0.7   # shorter pre-turn advance when the cell ahead is off the grid
-                              # (a full ADVANCE_TIME would drive past the grid edge) - but not
-                              # SO short that the robot pivots before reaching the intersection
-                              # and can't reach the new line (2026-09-08: 0.3s left it short at (8,1))
+# 2026-09-08: 1.0s drove the robot a full ~8cm PAST the node before pivoting, so
+# the perpendicular line ended up BEHIND it (out of the forward camera) and the
+# turn-exit search never found it. With the low accept thresholds the marker is
+# already close when the decision fires, so a shorter advance lands the pivot on
+# the node.
+ADVANCE_TIME = 0.55   # seconds
+ADVANCE_TIME_BOUNDARY = 0.4   # shorter still when the cell ahead is off the grid
 
 # Marker ID -> grid coordinate. PLACEHOLDER: the real ID/coordinate mapping
 # will be assigned once the markers are placed in the field.
@@ -250,7 +259,7 @@ ROBOT_PRIORITY = ["frodo1", "frodo2", "frodo3", "frodo4"]
 # (col, row); CITY_MAP id = row * GRID_COLS + col.  Edit freely per test.
 # 2026-09-08: metronome at marker id 9 = (0,1) for frodo1, id 28 = (1,3) for frodo4.
 TEST_TARGET_BY_ROBOT = {
-    "frodo1": (0, 1),   # CITY_MAP id 9
+    "frodo1": (2, 4),   # CITY_MAP id 9
     "frodo4": (1, 3),   # CITY_MAP id 28
 }
 
@@ -601,6 +610,11 @@ class ArtProject:
         turn_ki = _turn_gain.get("ki", TURN_KI)
         if _turn_gain:
             print(f"Turn gains (override for {frodo.common.id!r}): kp={turn_kp} ki={turn_ki}")
+
+        # This robot's commanded turn angle - see TURN_ANGLE_OVERRIDES_DEG above.
+        turn_angle = np.radians(TURN_ANGLE_OVERRIDES_DEG.get(frodo.common.id, np.degrees(TURN_ANGLE)))
+        if frodo.common.id in TURN_ANGLE_OVERRIDES_DEG:
+            print(f"Turn angle (override for {frodo.common.id!r}): {np.degrees(turn_angle):.0f} deg")
 
         # This robot's ArUco accept threshold - see ARUCO_MIN_SIZE_PX_OVERRIDES
         # above (per-robot, defaults to ARUCO_MIN_SIZE_PX if no override).
@@ -1279,7 +1293,15 @@ class ArtProject:
                 elif self.state == "ADVANCING_FROM_TURN":
                     exit_elapsed = now - turn_exit_start
                     exit_mask = get_color_mask(frame, CURRENT_TARGET_COLOR)
-                    exit_err, exit_line_seen, _ = calculate_deviation(exit_mask, display_frame)
+                    # Wider search than plain FOLLOWING: the new line may sit high in
+                    # the frame (further ahead) or look small/angled right after a
+                    # not-perfectly-centred pivot.
+                    _ef = find_line(exit_mask, roi_top=0.25, min_area=300)
+                    if _ef is not None:
+                        exit_err, exit_line_seen = _ef[0], True
+                    else:
+                        exit_err, exit_line_seen = 0.0, False
+                    calculate_deviation(exit_mask, display_frame)   # overlay only
                     cv2.putText(display_frame, f"EXITING TURN {exit_elapsed:.1f}s",
                                 (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
 
@@ -1388,7 +1410,7 @@ class ArtProject:
                         # of how much psi has drifted since the last turn.
                         psi_at_turn_start = self.pose_est.get()[2]
                         turn_target_psi = wrap_pi(
-                            psi_at_turn_start + (TURN_ANGLE if self.state == "TURNING_LEFT" else -TURN_ANGLE)
+                            psi_at_turn_start + (turn_angle if self.state == "TURNING_LEFT" else -turn_angle)
                         )
 
                     psi_now = self.pose_est.get()[2]

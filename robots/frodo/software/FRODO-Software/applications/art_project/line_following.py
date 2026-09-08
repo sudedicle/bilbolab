@@ -48,12 +48,14 @@ def get_color_mask(frame, target_color):
     return mask
 
 
-def find_line(mask):
+def find_line(mask, roi_top=ROI_TOP, min_area=MIN_AREA):
     """Finds the largest valid contour on the mask, does NOT draw anything (used
     for color probing). Returns: (error, area, cx, cy, c_shifted) or None (no
-    line found / too small)."""
+    line found / too small). `roi_top` (0 = whole frame) and `min_area` can be
+    relaxed for re-acquiring the line after a turn, when it may sit high in the
+    frame or appear small/angled."""
     h_img, w_img = mask.shape[:2]
-    y0 = int(h_img * ROI_TOP)
+    y0 = int(h_img * roi_top)
 
     roi_mask = mask[y0:, :]
     contours, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -64,7 +66,7 @@ def find_line(mask):
     c = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(c)
 
-    if area < MIN_AREA:
+    if area < min_area:
         return None
 
     M = cv2.moments(c)
