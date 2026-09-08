@@ -33,7 +33,9 @@ from aruco_utils import (
     create_aruco_detector, detect_markers, marker_bbox,
 )
 from servo_trigger import ArucoServoTrigger
-from grid_nav import grid_nodes, next_heading, DIRECTIONS
+from grid_nav import grid_nodes, next_heading, direction_between, DIRECTIONS
+from path_planner import plan_cooperative_paths
+from peer_sync import PeerSync
 
 # --- SERVO TRIGGER (on specific ArUco IDs) ---
 # First verify the pin/servo with servo_test.py.
@@ -47,6 +49,29 @@ SERVO_RETRIGGER_COOLDOWN = 5.0 # so passing the same marker doesn't retrigger it
 # sees it ahead of time) - close this distance open-loop (without looking at the
 # image) before triggering the servo. Measure in the field and adjust as needed.
 SERVO_TRIGGER_APPROACH_DISTANCE_M = 0.2
+# 2026-09-07 field test: the raw ArUco detector occasionally misreads noise as a
+# fake marker ID (observed: 656, 470, 944, 246, 190, 382, 549, 394 - none of these
+# are real markers anywhere in this app). Unlike CITY_MAP node acceptance (which
+# requires ARUCO_MIN_SIZE_PX=160px), the servo trigger had NO size check at all - a
+# noise ID that happened to land on 995-999 would have fired the servo with zero
+# validation. Observed noise topped out at 50px, real trigger-distance detections
+# were 90-180px - this sits with margin in between.
+SERVO_TRIGGER_MIN_SIZE_PX = 70
+
+# hoca's ACTUAL target points (2026-09-07): each metronome marker sits ON a path
+# LINE - i.e. at the midpoint of an EDGE between two adjacent CITY_MAP nodes, not
+# on a node itself (row is a whole grid step, col is X.5) - field-measured, in grid
+# units (already divided by GRID_CELL_M, same units as CITY_MAP). See
+# METRONOME_TARGET_NODES below (defined after world_to_grid_node()) for the node
+# each one snaps to - same rounding go_to_position() would apply if the host sends
+# these as real-world (x, y) instead.
+METRONOME_MARKER_GRID_POS = {
+    995: (2.5, 0.0),
+    996: (5.5, 2.0),
+    997: (7.5, 3.0),
+    998: (5.5, 4.0),
+    999: (3.5, 5.0),
+}
 
 # --- ARUCO FILTERS ---
 # The DECISION (direction/target) is made as soon as a marker is ACCEPTED - but
@@ -103,6 +128,19 @@ TURN_OMEGA_MAX = 1.4         # max angular speed allowed while turning (rad/s)
 TURN_TOLERANCE = np.radians(4.0)   # tolerance for "reached the target"
 TURN_SETTLE_TIME = 0.15      # stay within tolerance this long before calling the turn done (noise rejection)
 
+# Per-robot override for the turn PI gains above. TURN_KP/TURN_KI were tuned once in
+# the field and applied globally to every robot, but real motor/wheel/friction
+# differences between physical units mean one shared gain doesn't fit all - 2026-09-07
+# field test: frodo4 turns corners cleanly on the defaults, frodo1 visibly turns
+# weaker/undershoots with the SAME gains. Override per robot ID here instead of
+# bumping the global default (that would also change frodo4, which already works).
+# These are a first guess (not field-measured) - watch frodo1 turn and re-tune: still
+# weak/slow to converge -> raise "kp" further; oscillates/overshoots past the target
+# -> back "kp" off and/or raise "ki" instead.
+TURN_GAIN_OVERRIDES = {
+    "frodo1": {"kp": 2.2, "ki": 0.6},   # was kp=1.6 ki=0.4 (the global default)
+}
+
 # After a turn/park decision is made, the robot keeps driving STRAIGHT (WITHOUT
 # looking at the image) for this long, open-loop - so it ends up at the exact
 # center of the intersection/marker. Now that ARUCO_MIN_SIZE_PX already makes the
@@ -130,7 +168,21 @@ TURN_TIMEOUT = 10.0
 
 
 # =====================================================================================
-#  MULTI-ROBOT COLLISION AVOIDANCE (Approach A: reactive, no central host)
+#  MULTI-ROBOT COLLISION AVOIDANCE
+#    Approach A (below, unchanged): reactive, camera-only, no central host - a robot
+#    only "sees" whoever is physically ahead of it right now (ArUco body markers) and
+#    reroutes/emergency-stops off that. Always active, still the final safety net.
+#
+#    Approach B (hoca's "both start AND target known up front" scenario - see
+#    path_planner.py / peer_sync.py): each robot broadcasts its OWN (current_node,
+#    target_node) to the others over a dedicated UDP channel (peer_sync.py - no
+#    change to the host protocol at all), then runs Cooperative A*
+#    (path_planner.plan_cooperative_paths) locally using every robot's latest
+#    broadcast to plan a full conflict-free route, not just "avoid what the camera
+#    sees right now". Used in ArtProject._cooperative_next_step() below, layered ON
+#    TOP of Approach A (never replaces the camera-based emergency stop) - if no peer
+#    has broadcast recently (single-robot test, WiFi peer link down), it returns None
+#    and driving falls back to plain Approach A, unchanged.
 # =====================================================================================
 # Floor grid size - MUST match CITY_MAP's layout (id -> (id % COLS, id // COLS)).
 GRID_COLS = 9
@@ -156,6 +208,21 @@ def world_to_grid_node(x: float, y: float) -> tuple[int, int]:
     row = max(0, min(GRID_ROWS - 1, row))
     return col, row
 
+
+# marker_id -> nearest CITY_MAP node, from METRONOME_MARKER_GRID_POS above - same
+# round()+clamp world_to_grid_node() would apply if the host sent these as real
+# (x, y) meters instead. NOTE: each marker sits on an EDGE (col is X.5), so this
+# is one of its TWO adjacent nodes, picked by Python's round-half-to-even (e.g.
+# 2.5 -> 2, 3.5 -> 4) - if a marker should instead be approached from the OTHER
+# side, override that entry by hand.
+METRONOME_TARGET_NODES = {
+    marker_id: (
+        max(0, min(GRID_COLS - 1, int(round(gx)))),
+        max(0, min(GRID_ROWS - 1, int(round(gy)))),
+    )
+    for marker_id, (gx, gy) in METRONOME_MARKER_GRID_POS.items()
+}
+
 # Body markers per robot (robot/definitions.py -> ARUCO_SETTINGS_*). These are
 # the VERTICAL markers on the robot bodies; they are detected by frodo.sensors
 # (the floor grid has its own separate detector, see aruco_utils.py). Kept in
@@ -173,6 +240,19 @@ ROBOT_BODY_MARKERS = {
 # re-routes around it (shortest path with that cell removed). The symmetric
 # EMERGENCY stop below still applies to every robot regardless of priority.
 ROBOT_PRIORITY = ["frodo1", "frodo2", "frodo3", "frodo4"]
+
+# TEMPORARY for field testing without a host/hub connection (see self.target_node
+# below) - which metronome marker's node each robot heads for when no go_to_position()
+# has been called yet.
+# 2026-09-07 field test: frodo1 placed at (2,0), frodo4 placed at (0,0) - NOT
+# frodo1/frodo2 (the file's own placeholder default before today). Targets picked
+# so neither equals its own start (frodo1 starts ON 995's node - giving it that as
+# a target would mean "don't move") and the two paths cross rather than one just
+# chasing the other. Change freely for a different pairing/robots.
+TEST_TARGET_BY_ROBOT = {
+    "frodo1": METRONOME_TARGET_NODES[999],   # (2, 0) -> (4, 5)
+    "frodo4": METRONOME_TARGET_NODES[997],   # (0, 0) -> (8, 3)
+}
 
 # Another robot seen closer than *_BLOCK_DISTANCE_M and within +-*_AHEAD_BEARING
 # of straight-ahead makes the cell ahead "occupied". *_EMERGENCY_DISTANCE_M is a
@@ -220,8 +300,10 @@ class ArtProject:
         # --- shared state (written by WiFi commands, read by run()) ---
         # TEMPORARY for field testing without a host/hub connection - remove once
         # go_to_position() is actually being called over WiFi, this bypasses that
-        # entirely and starts the robot heading here immediately.
-        self.target_node = (5, 3)         # None = no goal, just keep following the line
+        # entirely and starts the robot heading here immediately. Now points at a
+        # real target (a metronome marker's node, see TEST_TARGET_BY_ROBOT above)
+        # instead of the old arbitrary (5, 3).
+        self.target_node = TEST_TARGET_BY_ROBOT.get(frodo.common.id, METRONOME_TARGET_NODES[995])
         self.stopped = False              # manual halt-in-place, set by stop()
         self._manual_servo_request = False
 
@@ -281,6 +363,11 @@ class ArtProject:
         frodo.logger.info(
             f"Collision avoidance: id={my_id!r} priority={self.my_priority} "
             f"route-around={sorted(self.higher_priority_markers)}")
+
+        # Approach B (see the big comment above CITY_MAP) - opened in run() once the
+        # robot's WiFi IP is known; stays None (and _cooperative_next_step() then
+        # always returns None, i.e. "no opinion, use Approach A") if that fails.
+        self.peer_sync: PeerSync | None = None
 
         self._register_wifi_commands()
 
@@ -445,6 +532,38 @@ class ArtProject:
                 and hit[0] <= OTHER_ROBOT_BLOCK_DISTANCE_M
                 and abs(hit[1]) <= OTHER_ROBOT_AHEAD_BEARING)
 
+    # ------------------------------------------------------------------------------------------------------------------
+    def _cooperative_next_step(self, current_coord, target_node):
+        """Approach B (see the big comment above CITY_MAP): Cooperative A* over
+        every robot's latest broadcast (current_node, target_node) from peer_sync.py.
+
+        Returns a cardinal direction ("EAST"/...) for the first hop of MY OWN plan,
+        "WAIT" if the plan has me yield a step, or None if there is nothing to say
+        (no peer_sync, no fresh peers, or planning failed) - the caller then falls
+        back to the plain reactive next_heading()/blocked_cells logic unchanged."""
+        if self.peer_sync is None:
+            return None
+        peers = self.peer_sync.get_fresh_peers()
+        if not peers:
+            return None
+
+        my_id = self.frodo.common.id
+        agents = {my_id: (current_coord, target_node), **peers}
+        # Same right-of-way convention as ROBOT_PRIORITY: earlier = planned first =
+        # higher priority. Any id not in ROBOT_PRIORITY (shouldn't happen) goes last.
+        order = [rid for rid in ROBOT_PRIORITY if rid in agents]
+        order += [rid for rid in agents if rid not in order]
+
+        plans = plan_cooperative_paths(agents, GRID_NODES, priority_order=order)
+        my_path = plans.get(my_id)
+        if not my_path or len(my_path) < 2:
+            return None   # no conflict-free path within the search horizon - Approach A guards
+
+        next_node, _ = my_path[1]
+        if next_node == current_coord:
+            return "WAIT"
+        return direction_between(current_coord, next_node)
+
     # === MAIN LOOP ====================================================================================================
     def run(self):
         frodo = self.frodo
@@ -453,11 +572,34 @@ class ArtProject:
         ip = getInterfaceIP("wlan0")
         print(f"\n---> LIVE: http://{ip}:5001/preview <--- \n")
 
+        # Approach B peer link (see _cooperative_next_step) - broadcasts our own
+        # (current_node, target_node) and listens for the other robots' the same way.
+        # Not safety-critical (Approach A's camera check still guards regardless), so
+        # a failure here (e.g. no WiFi IP yet) just disables Approach B, not the robot.
+        try:
+            self.peer_sync = PeerSync(
+                robot_id=frodo.common.id,
+                state_fn=lambda: (self.current_node, self.target_node),
+                address=ip,
+            )
+            self.peer_sync.start()
+        except OSError as e:
+            frodo.logger.warning(f"PeerSync unavailable ({e}) - Approach B disabled, Approach A still active")
+            self.peer_sync = None
+
         # ---------------- PARAMETERS ----------------
         CURRENT_TARGET_COLOR = "pink"
         kp = 0.008
         base_speed = 0.08           # kept low for the straight-drive test
         track_width = 0.150
+
+        # This robot's turn PI gains - see TURN_GAIN_OVERRIDES above (per-robot,
+        # defaults to the shared TURN_KP/TURN_KI if this robot has no override).
+        _turn_gain = TURN_GAIN_OVERRIDES.get(frodo.common.id, {})
+        turn_kp = _turn_gain.get("kp", TURN_KP)
+        turn_ki = _turn_gain.get("ki", TURN_KI)
+        if _turn_gain:
+            print(f"Turn gains (override for {frodo.common.id!r}): kp={turn_kp} ki={turn_ki}")
 
         # ROBOT_HEADING is NOT guessed/assumed - it's derived from the robot's own
         # first two marker fixes (see HEADING CALIBRATION below), so it's correct
@@ -493,7 +635,7 @@ class ArtProject:
         # Once we decide "arrived" at the target, the robot keeps driving straight
         # OPEN-LOOP (without looking at the image) for PARKING_TIME before stopping -
         # so it ends up at the exact center of the marker (see the ADVANCE_TIME note above).
-        PARKING_TIME = ADVANCE_TIME + 0.5
+        PARKING_TIME = ADVANCE_TIME + 0.2
         stop_timer = 0
 
         # APPROACHING state: a direction decision was made but not yet APPLIED. Line
@@ -624,7 +766,10 @@ class ArtProject:
                 # (FOLLOWING) - so it doesn't clash with the robot's position/speed
                 # during a turn/park/approach.
                 if self.state == "FOLLOWING":
-                    detected_ids_now = [detected_id for detected_id, _ in detected_markers]
+                    detected_ids_now = [
+                        detected_id for detected_id, marker_corners in detected_markers
+                        if marker_bbox(marker_corners)[-1] >= SERVO_TRIGGER_MIN_SIZE_PX
+                    ]
                     servo_matched_id = self.servo_trigger.matching_id(detected_ids_now, now)
                     if servo_matched_id is not None:
                         print(f"[{now:.1f}] Trigger ArUco ID seen: {servo_matched_id} - approaching marker")
@@ -773,23 +918,45 @@ class ArtProject:
                     # higher-priority robot is sitting in the cell I'd drive into
                     # by going straight, drop that cell so BFS finds a detour.
                     blocked_cells = set()
+                    reactive_ahead_cell = None
                     if self._forward_cell_blocked():
                         step = DIRECTIONS.get(ROBOT_HEADING, (0, 0))
-                        ahead_cell = (current_coord[0] + step[0], current_coord[1] + step[1])
-                        blocked_cells.add(ahead_cell)
-                        print(f"  [avoidance] higher-priority robot ahead - routing around {ahead_cell}")
+                        reactive_ahead_cell = (current_coord[0] + step[0], current_coord[1] + step[1])
+                        blocked_cells.add(reactive_ahead_cell)
+                        print(f"  [avoidance] higher-priority robot ahead - routing around {reactive_ahead_cell}")
 
-                    desired_heading = next_heading(current_coord, target_node, GRID_NODES,
-                                                   blocked=blocked_cells)
-                    if desired_heading is None and blocked_cells:
-                        # No detour exists (rare on an open grid). Fall back to the
-                        # unblocked shortest path - the EMERGENCY stop still keeps
-                        # the robots from actually touching.
-                        print("  [avoidance] no detour - holding to shortest path, emergency-stop will guard")
-                        desired_heading = next_heading(current_coord, target_node, GRID_NODES)
-                    if desired_heading is None:
-                        print(f"!!! No path from {current_coord} to {target_node} - staying put")
-                        break
+                    # Approach B: Cooperative A* over what every robot last broadcast
+                    # (peer_sync.py) - plans a full conflict-free route instead of only
+                    # reacting to whoever the camera sees right now. The camera check
+                    # above still wins if the two disagree (ground truth beats a
+                    # <=0.5s-old broadcast) - see the `!= reactive_ahead_cell` guard.
+                    coop_step = self._cooperative_next_step(current_coord, target_node)
+                    coop_cell = None
+                    if coop_step and coop_step != "WAIT":
+                        dx, dy = DIRECTIONS[coop_step]
+                        coop_cell = (current_coord[0] + dx, current_coord[1] + dy)
+
+                    if coop_cell is not None and coop_cell != reactive_ahead_cell:
+                        desired_heading = coop_step
+                        print(f"  [cooperative] plan says {desired_heading}")
+                    else:
+                        if coop_step == "WAIT":
+                            step = DIRECTIONS.get(ROBOT_HEADING, (0, 0))
+                            wait_cell = (current_coord[0] + step[0], current_coord[1] + step[1])
+                            blocked_cells.add(wait_cell)
+                            print(f"  [cooperative] yielding at {current_coord} - routing around {wait_cell}")
+
+                        desired_heading = next_heading(current_coord, target_node, GRID_NODES,
+                                                       blocked=blocked_cells)
+                        if desired_heading is None and blocked_cells:
+                            # No detour exists (rare on an open grid). Fall back to the
+                            # unblocked shortest path - the EMERGENCY stop still keeps
+                            # the robots from actually touching.
+                            print("  [avoidance] no detour - holding to shortest path, emergency-stop will guard")
+                            desired_heading = next_heading(current_coord, target_node, GRID_NODES)
+                        if desired_heading is None:
+                            print(f"!!! No path from {current_coord} to {target_node} - staying put")
+                            break
 
                     print(f"Heading: {ROBOT_HEADING} -> Desired: {desired_heading}")
 
@@ -853,6 +1020,28 @@ class ArtProject:
 
                     mask = get_color_mask(frame, CURRENT_TARGET_COLOR)          # RAW frame!
                     error, line_detected, _area = calculate_deviation(mask, display_frame)
+
+                    # 2026-09-07 field observation: heading calibration needs a SECOND
+                    # real node fix (see HEADING CALIBRATION above) to correct the
+                    # initial pink/green guess - if that second fix never comes (line
+                    # lost before reaching the next marker), CURRENT_TARGET_COLOR stays
+                    # wrong forever and the robot wanders off on stray same-color noise
+                    # until it runs out of anything to follow (observed: frodo1 "went
+                    # diagonal", LINE LOST far from where it should have stopped).
+                    # Recovery: once heading isn't known yet AND the current color just
+                    # failed, try the OTHER color before giving up - this only fires on
+                    # an actual failure (not every frame), so it can't reintroduce the
+                    # per-frame flip-flop the LAST_SEEN_ID gating above was written to
+                    # avoid.
+                    if not line_detected and not heading_known:
+                        other_color = "green" if CURRENT_TARGET_COLOR == "pink" else "pink"
+                        other_found = find_line(get_color_mask(frame, other_color))
+                        if other_found is not None:
+                            print(f"  [color] {CURRENT_TARGET_COLOR} lost, heading not yet "
+                                  f"known - switching to {other_color}")
+                            CURRENT_TARGET_COLOR = other_color
+                            mask = get_color_mask(frame, CURRENT_TARGET_COLOR)
+                            error, line_detected, _area = calculate_deviation(mask, display_frame)
 
                     if line_detected:
                         line_lost_since = None
@@ -1088,13 +1277,13 @@ class ArtProject:
                     # target (the error flips sign) the P term's correction gets
                     # smothered for seconds - that's the "very slow recovery after
                     # overshoot" observed in the field.
-                    w_pretest = TURN_KP * e_psi + turn_i_acc
+                    w_pretest = turn_kp * e_psi + turn_i_acc
                     is_saturated = abs(w_pretest) >= TURN_OMEGA_MAX
                     same_direction = (e_psi * w_pretest) > 0
                     if not (is_saturated and same_direction):
-                        turn_i_acc = float(np.clip(turn_i_acc + e_psi * dt_turn * TURN_KI,
+                        turn_i_acc = float(np.clip(turn_i_acc + e_psi * dt_turn * turn_ki,
                                                     -TURN_I_LIMIT, TURN_I_LIMIT))
-                    omega_cmd = float(np.clip(TURN_KP * e_psi + turn_i_acc,
+                    omega_cmd = float(np.clip(turn_kp * e_psi + turn_i_acc,
                                                -TURN_OMEGA_MAX, TURN_OMEGA_MAX))
 
                     v_left, v_right = calculate_wheel_speeds(0.0, omega_cmd, track_width)
@@ -1163,6 +1352,11 @@ class ArtProject:
                 self.pose_est.stop()
             except Exception:
                 pass
+            if self.peer_sync is not None:
+                try:
+                    self.peer_sync.stop()
+                except Exception:
+                    pass
             self.servo_trigger.shutdown()
 
 
