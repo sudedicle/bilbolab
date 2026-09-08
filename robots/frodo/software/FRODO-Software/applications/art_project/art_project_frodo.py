@@ -105,6 +105,12 @@ ARUCO_MIN_SIZE_PX_OVERRIDES = {
     "frodo1": 80,
     "frodo2": 80,
     "frodo3": 107,
+    # 2026-09-08 field logs: frodo4's real grid markers, even centred, only reach
+    # ~133-176px (noise tops out ~110px) - the 160 default rejected most of them,
+    # so on straight runs it read every node but after a turn, once slightly off
+    # the line, it stopped accepting markers entirely and drifted. 140 catches the
+    # real ones with margin over noise.
+    "frodo4": 140,
 }
 
 ARRIVE_DISTANCE_M = 0.06   # "arrived" once the EKF (x,y) is this close (m) to the target marker's world position
@@ -167,6 +173,8 @@ TURN_GAIN_OVERRIDES = {
 # wrong way (the old design used line-following here and that caused a "two-step"
 # wobble).
 ADVANCE_TIME = 1.0   # seconds
+ADVANCE_TIME_BOUNDARY = 0.3   # shorter pre-turn advance when the cell ahead is off the grid
+                              # (a full ADVANCE_TIME would drive past the grid edge)
 
 # Marker ID -> grid coordinate. PLACEHOLDER: the real ID/coordinate mapping
 # will be assigned once the markers are placed in the field.
@@ -348,9 +356,20 @@ class ArtProject:
         except (ImportError, ModuleNotFoundError, FileNotFoundError, OSError) as e:
             frodo.logger.warning(f"HardwareServo unavailable ({e}) - using NullServo (servo will not move)")
             self.servo = NullServo()
+        # Auto servo-trigger fires ONLY on THIS robot's own assigned metronome
+        # marker (the one whose node is our current target), not on any 995-999
+        # marker seen along the way - the mission is "reach YOUR marker, then run
+        # the servo". If the target isn't one of the metronome nodes (host sent an
+        # arbitrary go_to_position), there's no auto trigger - arrival at the
+        # target node still fires the servo (see the PARKING/DONE block).
+        self._assigned_metronome_id = next(
+            (mid for mid, node in METRONOME_TARGET_NODES.items() if node == self.target_node), None)
+        _auto_trigger_ids = {self._assigned_metronome_id} if self._assigned_metronome_id is not None else set()
+        frodo.logger.info(f"Assigned metronome marker: {self._assigned_metronome_id} "
+                          f"(target node {self.target_node})")
         self.servo_trigger = ArucoServoTrigger(
             self.servo, frodo.control.setTrackSpeed,
-            trigger_ids=SERVO_TRIGGER_IDS,
+            trigger_ids=_auto_trigger_ids,
             angle_home=SERVO_ANGLE_HOME, angle_trigger=SERVO_ANGLE_TRIGGER,
             forward_speed=0.08, forward_duration=SERVO_FORWARD_DURATION,
             approach_distance_m=SERVO_TRIGGER_APPROACH_DISTANCE_M,
@@ -664,9 +683,24 @@ class ArtProject:
         # just a brief blind floor (avoid reacting to a stray glimpse before the robot
         # has moved off the pivot point at all), MAX_TIME is a ceiling so we don't
         # drive forever if the lane is genuinely not reachable this way.
-        TURN_EXIT_ADVANCE_MIN_TIME = 0.2   # seconds
-        TURN_EXIT_ADVANCE_MAX_TIME = 1.2   # seconds
+        # ADVANCING_FROM_TURN: a pivot turn is never perfectly centred on the
+        # intersection (and TURN_ANGLE deliberately over-commands), so afterwards
+        # the robot is offset from / angled off the new-colour line. Driving
+        # straight open-loop CANNOT correct a lateral offset - the robot then
+        # drives parallel to the line, never re-centres, and misses every marker
+        # from there on (seen in the field: turned NORTH at (8,0), then drove the
+        # whole column reading nothing, ending at (8,5)). So: as soon as the new
+        # line is visible ANYWHERE in the ROI, actively steer onto it; only hand
+        # over to FOLLOWING once it is roughly centred. If it never comes into
+        # view by driving straight, sweep left/right in place to find it.
+        TURN_EXIT_BLIND_CREEP_TIME = 0.25  # brief blind creep off the pivot point first
+        TURN_EXIT_STRAIGHT_TIME = 1.2      # then creep straight this long, hoping the line appears
+        TURN_EXIT_SWEEP_TIME = 2.0         # then sweep +-this long each side to find it
+        TURN_EXIT_CENTER_PX = 60           # |error| under this = "centred enough" to start FOLLOWING
+        TURN_EXIT_CENTER_HOLD = 0.2        # ...for this long
         turn_exit_start = None
+        turn_exit_centered_since = None
+        turn_exit_sweep_start = None
 
         # Once we decide "arrived" at the target, the robot keeps driving straight
         # OPEN-LOOP (without looking at the image) for PARKING_TIME before stopping -
@@ -683,11 +717,13 @@ class ArtProject:
         last_approach_log = 0.0
         approach_line_lost_since = None
         arriving_node = None         # the grid node we're APPROACHING/PARKING toward
+        arrived_node = None          # the grid node we finished a mission at (see DONE)
 
         # ADVANCING_TO_TURN: a turn decision was made, the robot keeps driving straight
         # for ADVANCE_TIME, then the turn actually starts (see the note above).
         pre_turn_next_state = None   # "TURNING_LEFT" | "TURNING_RIGHT"
         pre_turn_start = None
+        advance_time_this_turn = ADVANCE_TIME   # per-turn (shorter at grid boundaries)
 
         # SERVO_APPROACHING/SERVO_ADVANCING: starts once the servo trigger ID is seen
         # (see the SERVO_* constants above). Same idea as ADVANCING_TO_TURN - open-loop
@@ -750,6 +786,24 @@ class ArtProject:
                     continue
                 elif self.state == "IDLE":
                     self.state = "FOLLOWING"
+
+                # ---------------- DONE (arrived at the assigned target + servo fired) ----------------
+                # Hold in place. A fresh go_to_position() (sets a new target_node and
+                # clears self.stopped) resumes navigation.
+                if self.state == "DONE":
+                    frodo.control.setTrackSpeed(0.0, 0.0)
+                    with self._lock:
+                        new_target = self.target_node
+                    if new_target is not None and new_target != arrived_node:
+                        print(f"New target {new_target} received - resuming navigation")
+                        self.state = "FOLLOWING"
+                    else:
+                        cv2.putText(display_frame, "MISSION COMPLETE", (40, 150),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 200, 0), 3)
+                        with self._stream_frame_lock:
+                            self.frame_out = display_frame
+                        time.sleep(0.05)
+                        continue
 
                 # ---------------- STOPPED (unrecoverable failure) ----------------
                 if self.state == "STOPPED":
@@ -1092,6 +1146,15 @@ class ArtProject:
                             pre_turn_next_state = None
 
                         if pre_turn_next_state is not None:
+                            # Pre-turn open-loop advance to the intersection centre.
+                            # At a BOUNDARY node the cell straight ahead doesn't
+                            # exist - a full ADVANCE_TIME there drives the robot off
+                            # the end of the grid, so the pivot happens away from the
+                            # new line and it never re-acquires it (seen in the field
+                            # at (8,0)). Use a short advance in that case.
+                            _odx, _ody = DIRECTIONS.get(ROBOT_HEADING, (0, 0))
+                            _ahead = (current_coord[0] + _odx, current_coord[1] + _ody)
+                            advance_time_this_turn = ADVANCE_TIME if _ahead in GRID_NODES else ADVANCE_TIME_BOUNDARY
                             # NOTE: CURRENT_TARGET_COLOR is NOT changed here - the robot
                             # is still coming from the old position during
                             # ADVANCING_TO_TURN, the color only switches once the turn
@@ -1244,7 +1307,7 @@ class ArtProject:
                     cv2.putText(display_frame, f"ADVANCING {advance_elapsed:.1f}s -> {TURN_TARGET_HEADING}",
                                 (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
 
-                    if advance_elapsed >= ADVANCE_TIME:
+                    if advance_elapsed >= advance_time_this_turn:
                         print(f"Reached intersection ({advance_elapsed:.2f}s) -> turn starting")
                         # The color switches now: the turn is actually starting, the
                         # robot will look for the new direction's color instead of
@@ -1265,18 +1328,48 @@ class ArtProject:
                 # reports LINE LOST even though the color/logic are both correct.
                 elif self.state == "ADVANCING_FROM_TURN":
                     exit_elapsed = now - turn_exit_start
-                    frodo.control.setTrackSpeed(base_speed, base_speed)
+                    exit_mask = get_color_mask(frame, CURRENT_TARGET_COLOR)
+                    exit_err, exit_line_seen, _ = calculate_deviation(exit_mask, display_frame)
                     cv2.putText(display_frame, f"EXITING TURN {exit_elapsed:.1f}s",
                                 (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
 
-                    exit_line_seen = False
-                    if exit_elapsed >= TURN_EXIT_ADVANCE_MIN_TIME:
-                        exit_mask = get_color_mask(frame, CURRENT_TARGET_COLOR)
-                        _, exit_line_seen, _ = calculate_deviation(exit_mask, display_frame)
-
-                    if exit_line_seen or exit_elapsed >= TURN_EXIT_ADVANCE_MAX_TIME:
+                    if exit_line_seen and exit_elapsed >= TURN_EXIT_BLIND_CREEP_TIME:
+                        # line is in view somewhere - steer onto it (not blind straight)
+                        turn_exit_sweep_start = None
+                        fwd_e, ang_e = proportional_controller(exit_err, kp, base_speed)
+                        vL_e, vR_e = calculate_wheel_speeds(fwd_e, ang_e, track_width)
+                        frodo.control.setTrackSpeed(vL_e, vR_e)
+                        if abs(exit_err) < TURN_EXIT_CENTER_PX:
+                            if turn_exit_centered_since is None:
+                                turn_exit_centered_since = now
+                            elif now - turn_exit_centered_since > TURN_EXIT_CENTER_HOLD:
+                                print(f"  [turn exit] line re-acquired (err={exit_err:+.0f}px) -> FOLLOWING")
+                                self.state = "FOLLOWING"
+                                turn_exit_start = None
+                                turn_exit_centered_since = None
+                        else:
+                            turn_exit_centered_since = None
+                    elif exit_elapsed < TURN_EXIT_BLIND_CREEP_TIME + TURN_EXIT_STRAIGHT_TIME:
+                        # no line yet - creep straight, it may still come into frame
+                        frodo.control.setTrackSpeed(base_speed, base_speed)
+                    elif exit_elapsed < TURN_EXIT_BLIND_CREEP_TIME + TURN_EXIT_STRAIGHT_TIME + 2 * TURN_EXIT_SWEEP_TIME:
+                        # still nothing - sweep in place: one way, then back the other way
+                        if turn_exit_sweep_start is None:
+                            turn_exit_sweep_start = now
+                        swept = now - turn_exit_sweep_start
+                        sweep_omega = 0.6 if swept < TURN_EXIT_SWEEP_TIME else -0.6
+                        vL_e, vR_e = calculate_wheel_speeds(0.0, sweep_omega, track_width)
+                        frodo.control.setTrackSpeed(vL_e, vR_e)
+                        cv2.putText(display_frame, "TURN EXIT - SEARCHING LINE", (10, 220),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                    else:
+                        # give up - let FOLLOWING report LINE LOST to the host
+                        print("  [turn exit] line not found by straight+sweep - handing to FOLLOWING (will report lost)")
+                        frodo.control.setTrackSpeed(0.0, 0.0)
                         self.state = "FOLLOWING"
                         turn_exit_start = None
+                        turn_exit_centered_since = None
+                        turn_exit_sweep_start = None
 
                 # ================= SERVO: APPROACHING THE MARKER (automatic) =================
                 # Same open-loop idea as ADVANCING_TO_TURN (driving WITHOUT looking at
@@ -1307,9 +1400,15 @@ class ArtProject:
                     if servo_elapsed >= self.servo_trigger.forward_duration:
                         frodo.control.setTrackSpeed(0.0, 0.0)
                         self.servo_trigger.rotate_to_home()             # blocking, short (~settle_time), robot stopped
-                        print(">>> SERVO ACTION COMPLETE - resuming line following.")
                         self.frodo.communication.send_event('art_project_servo_triggered', {'node': self.current_node})
-                        self.state = "FOLLOWING"
+                        # trigger_ids only holds our OWN assigned metronome marker, so
+                        # getting here means we reached it -> mission complete.
+                        arrived_node = self.current_node
+                        with self._lock:
+                            if self.target_node == arrived_node:
+                                self.target_node = None
+                        print(">>> SERVO ACTION COMPLETE - MISSION COMPLETE, holding until a new go_to_position().")
+                        self.state = "DONE"
 
                 # ================= SHORT STRAIGHT ADVANCE AT THE TARGET =================
                 # Same idea as ADVANCING_TO_TURN: drive forward at a fixed speed
@@ -1322,14 +1421,25 @@ class ArtProject:
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
                     if time.time() > stop_timer:
                         frodo.control.setTrackSpeed(0.0, 0.0)
-                        print("\n*** ARRIVED. Resuming line following, waiting for next go_to_position(). ***")
                         arrived_node = arriving_node
                         arriving_node = None
+
+                        # --- trigger the metronome servo on arrival at the assigned target ---
+                        # This is the whole point of the mission ("go to your marker,
+                        # then run the servo"). Robot is stopped, so the cycle covers
+                        # no distance and can't miss anything.
+                        print("\n*** ARRIVED at target - triggering servo ***")
+                        self.servo_trigger.rotate_to_trigger()
+                        self.servo_trigger.rotate_to_home()
+                        self.frodo.communication.send_event('art_project_servo_triggered',
+                                                            {'node': list(arrived_node) if arrived_node else None})
+
                         with self._lock:
                             # Only clear the target if the host hasn't already set a new one.
                             if self.target_node == arrived_node:
                                 self.target_node = None
-                        self.state = "FOLLOWING"
+                        self.state = "DONE"
+                        print("*** MISSION COMPLETE - holding until a new go_to_position(). ***")
                         arrived_pose_x, arrived_pose_y, arrived_pose_psi = self.pose_est.get()
                         arrived_target = None
                         if arrived_node is not None:
@@ -1417,6 +1527,8 @@ class ArtProject:
                             frodo.control.setTrackSpeed(0.0, 0.0)
                             self.state = "ADVANCING_FROM_TURN"
                             turn_exit_start = now
+                            turn_exit_centered_since = None
+                            turn_exit_sweep_start = None
                             turn_start = None
                             turn_settle_start = None
                     else:
