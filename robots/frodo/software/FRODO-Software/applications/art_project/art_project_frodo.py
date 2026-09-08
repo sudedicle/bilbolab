@@ -367,8 +367,26 @@ class ArtProject:
         self._assigned_metronome_id = next(
             (mid for mid, node in METRONOME_TARGET_NODES.items() if node == self.target_node), None)
         _auto_trigger_ids = {self._assigned_metronome_id} if self._assigned_metronome_id is not None else set()
+
+        # The metronome marker sits at the MIDPOINT of an edge, not on a node (e.g.
+        # 997 is at (7.5, 3.0), between nodes (7,3) and (8,3)). Navigating to the
+        # rounded node and firing the servo there triggers it ~14 cm short of the
+        # actual marker (seen in the field). So: the two nodes the marker's edge
+        # connects are BOTH acceptable "entry" nodes - reaching either one, the
+        # robot then drives ACROSS that edge to the other node, passing directly
+        # over the marker at the midpoint where the auto-trigger fires. If it
+        # crosses the whole edge without seeing the marker, the servo fires at the
+        # far node as a fallback (see the PARKING/DONE block).
+        self._metronome_pair = None
+        self._metronome_crossing = False
+        if self._assigned_metronome_id is not None:
+            _mx, _my = METRONOME_MARKER_GRID_POS[self._assigned_metronome_id]
+            if _mx != int(_mx):
+                self._metronome_pair = ((int(_mx), int(_my)), (int(_mx) + 1, int(_my)))
+            elif _my != int(_my):
+                self._metronome_pair = ((int(_mx), int(_my)), (int(_mx), int(_my) + 1))
         frodo.logger.info(f"Assigned metronome marker: {self._assigned_metronome_id} "
-                          f"(target node {self.target_node})")
+                          f"(target node {self.target_node}, edge nodes {self._metronome_pair})")
         self.servo_trigger = ArucoServoTrigger(
             self.servo, frodo.control.setTrackSpeed,
             trigger_ids=_auto_trigger_ids,
@@ -1015,7 +1033,24 @@ class ArtProject:
                     if target_node is None:
                         break
 
-                    if current_coord == target_node:
+                    # Reached an entry node of the metronome's edge - don't park here,
+                    # redirect to the OTHER end so the next leg runs ALONG the edge,
+                    # straight over the marker (auto-trigger fires at the midpoint).
+                    # Re-decide THIS frame (don't break) - the marker is still in view
+                    # so the turn onto the edge happens now, not after driving blind.
+                    if (self._metronome_pair is not None and not self._metronome_crossing
+                            and current_coord in self._metronome_pair):
+                        other_end = (self._metronome_pair[1] if current_coord == self._metronome_pair[0]
+                                     else self._metronome_pair[0])
+                        print(f"*** Reached metronome edge at {current_coord} - crossing to {other_end} "
+                              f"to pass marker {self._assigned_metronome_id} ***")
+                        self._metronome_crossing = True
+                        with self._lock:
+                            self.target_node = other_end
+                        target_node = other_end
+                        # fall through to the turn/continue decision with the new target
+
+                    elif current_coord == target_node:
                         print(f"*** TARGET NODE SEEN - approaching marker center before parking ***")
                         pending_action = "TARGET"
                         pending_node_xy = MARKER_WORLD_MAP.get(detected_id)
@@ -1404,11 +1439,14 @@ class ArtProject:
                         self.servo_trigger.rotate_to_home()             # blocking, short (~settle_time), robot stopped
                         self.frodo.communication.send_event('art_project_servo_triggered', {'node': self.current_node})
                         # trigger_ids only holds our OWN assigned metronome marker, so
-                        # getting here means we reached it -> mission complete.
+                        # getting here means we reached it -> mission complete. Clear
+                        # the target unconditionally (it may still point at the far
+                        # edge node we were crossing toward) so DONE doesn't treat it
+                        # as a fresh go_to_position() and resume.
                         arrived_node = self.current_node
+                        self._metronome_crossing = False
                         with self._lock:
-                            if self.target_node == arrived_node:
-                                self.target_node = None
+                            self.target_node = None
                         print(">>> SERVO ACTION COMPLETE - MISSION COMPLETE, holding until a new go_to_position().")
                         self.state = "DONE"
 
@@ -1426,22 +1464,29 @@ class ArtProject:
                         arrived_node = arriving_node
                         arriving_node = None
 
-                        # --- trigger the metronome servo on arrival at the assigned target ---
-                        # This is the whole point of the mission ("go to your marker,
-                        # then run the servo"). Robot is stopped, so the cycle covers
-                        # no distance and can't miss anything.
-                        print("\n*** ARRIVED at target - triggering servo ***")
-                        self.servo_trigger.rotate_to_trigger()
-                        self.servo_trigger.rotate_to_home()
-                        self.frodo.communication.send_event('art_project_servo_triggered',
-                                                            {'node': list(arrived_node) if arrived_node else None})
+                        _metronome_mission = self._assigned_metronome_id is not None
+                        if _metronome_mission:
+                            # Fallback: we drove the whole metronome edge without the
+                            # auto-trigger seeing the marker (blur / missed it) - fire
+                            # the servo here at the far node. Robot is stopped, so the
+                            # cycle covers no distance.
+                            print(f"\n*** ARRIVED at metronome node {arrived_node} without a marker "
+                                  f"sighting - triggering servo (fallback) ***")
+                            self.servo_trigger.rotate_to_trigger()
+                            self.servo_trigger.rotate_to_home()
+                            self.frodo.communication.send_event('art_project_servo_triggered',
+                                                                {'node': list(arrived_node) if arrived_node else None})
 
+                        self._metronome_crossing = False
                         with self._lock:
-                            # Only clear the target if the host hasn't already set a new one.
-                            if self.target_node == arrived_node:
+                            # Metronome mission is over regardless; for a plain host
+                            # target only clear it if unchanged.
+                            if _metronome_mission or self.target_node == arrived_node:
                                 self.target_node = None
-                        self.state = "DONE"
-                        print("*** MISSION COMPLETE - holding until a new go_to_position(). ***")
+                        self.state = "DONE" if _metronome_mission else "FOLLOWING"
+                        print("*** MISSION COMPLETE - holding until a new go_to_position(). ***"
+                              if _metronome_mission else
+                              "\n*** ARRIVED. Resuming line following, waiting for next go_to_position(). ***")
                         arrived_pose_x, arrived_pose_y, arrived_pose_psi = self.pose_est.get()
                         arrived_target = None
                         if arrived_node is not None:
