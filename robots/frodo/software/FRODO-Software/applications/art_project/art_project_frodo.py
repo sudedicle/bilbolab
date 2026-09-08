@@ -90,9 +90,20 @@ ARUCO_MIN_SIZE_PX_OVERRIDES = {
     "frodo4": 140,
 }
 
-ARRIVE_DISTANCE_M = 0.06   # "arrived" once the EKF (x,y) is this close (m) to the target marker's world position
-APPROACH_TIMEOUT = 6.0     # safety net: stop anyway if we haven't arrived within this time
+# Arrival at the target node is judged by the TARGET MARKER's pixel SIZE, not the
+# EKF distance - the EKF drifts badly without frequent fixes (2026-09-08: it sat
+# ~0.2 m off and never converged, so the robot "arrived" a whole node past the
+# target). Once the target marker is seen this big it is right under the robot.
+ARRIVE_MARKER_SIZE_PX = 130
+APPROACH_TIMEOUT = 5.0     # safety net: stop anyway if the marker never gets big enough
 APPROACH_STALL_GRACE = 0.5 # if the line has been lost this long (robot already stopped), call it "arrived" right away
+PARK_TIME_ON_MARKER = 0.4  # short forward settle when we're already on the marker (vs PARKING_TIME from farther out)
+
+# FOLLOWING with the line present but NO accepted marker for this long => the robot
+# has drifted off the grid or overshot its target with nothing to stop it (seen in
+# the field: drove straight into a wall past the target). ~3 cells at base_speed -
+# comfortably longer than a turn sequence + one cell so it won't false-fire.
+MARKER_TIMEOUT_S = 12.0
 
 # In FOLLOWING (a plain pass-through node, not the final target), a hard stop
 # the instant the line is lost can permanently strand the robot: an ArUco card
@@ -654,15 +665,16 @@ class ArtProject:
         PARKING_TIME = ADVANCE_TIME + 0.2
         stop_timer = 0
 
-        # APPROACHING state: a direction decision was made but not yet APPLIED. Line
-        # following keeps running until the EKF (x,y) gets close to the marker's world
-        # position (pending_node_xy), then pending_action is applied ONCE (see the note above).
-        pending_action = None        # "TARGET" | None
-        pending_node_xy = None
+        # APPROACHING state: the target node's marker has been seen but from too far
+        # (small) - keep line-following straight at it until the marker grows to
+        # ARRIVE_MARKER_SIZE_PX (we're on it), then PARKING.
         approach_start = None
         last_approach_log = 0.0
         approach_line_lost_since = None
-        arriving_node = None         # the grid node we're APPROACHING/PARKING toward
+        approach_target_id = None     # CITY_MAP id of the marker we're closing on
+        approach_target_size = 0      # its latest pixel size
+        arriving_node = None          # the grid node we're APPROACHING/PARKING toward
+        last_accepted_marker_time = None   # for MARKER_TIMEOUT_S (drifted-off-grid guard)
         arrived_node = None          # the grid node we finished a mission at (see DONE)
 
         # ADVANCING_TO_TURN: a turn decision was made, the robot keeps driving straight
@@ -746,7 +758,7 @@ class ArtProject:
                 # ---------------- STOPPED (unrecoverable failure) ----------------
                 if self.state == "STOPPED":
                     frodo.control.setTrackSpeed(0.0, 0.0)
-                    cv2.putText(display_frame, "FAILED: TURN TIMEOUT", (60, 200),
+                    cv2.putText(display_frame, f"FAILED: {STOP_REASON}", (60, 200),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
                     print(f"\n!!! MISSION FAILED ({STOP_REASON}). Motors locked. !!!")
                     with self._stream_frame_lock:
@@ -810,6 +822,11 @@ class ArtProject:
                     cv2.putText(display_frame, f"{detected_id} ({aruco_size}px)", (x, max(y - 10, 20)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
+                    # While closing on the target, keep the latest size of ITS marker
+                    # (arrival is judged by this, not the EKF).
+                    if self.state == "APPROACHING" and detected_id == approach_target_id:
+                        approach_target_size = aruco_size
+
                     # --- filter decision ---
                     if center_y < ARUCO_Y_MIN * h_img or aruco_size < aruco_min_size_px:
                         status = "TOO FAR"
@@ -854,6 +871,7 @@ class ArtProject:
                     # CURRENT_TARGET_COLOR frame to frame and the robot never drives
                     # straight (observed in the field: spins in place near markers).
                     current_coord = CITY_MAP[detected_id]
+                    last_accepted_marker_time = now
                     if detected_id != LAST_SEEN_ID:
                         LAST_SEEN_ID = detected_id
                         self.current_node = current_coord
@@ -927,12 +945,20 @@ class ArtProject:
                         break
 
                     if current_coord == target_node:
-                        print(f"*** TARGET NODE SEEN - approaching marker center before parking ***")
-                        pending_action = "TARGET"
-                        pending_node_xy = MARKER_WORLD_MAP.get(detected_id)
-                        approach_start = now
                         arriving_node = target_node
-                        self.state = "APPROACHING"
+                        approach_target_id = detected_id
+                        approach_target_size = aruco_size
+                        approach_line_lost_since = None
+                        if aruco_size >= ARRIVE_MARKER_SIZE_PX:
+                            # already on the marker - short settle, then park/servo
+                            print(f"*** TARGET {target_node} - marker {aruco_size}px, on it -> parking ***")
+                            frodo.control.setTrackSpeed(0.0, 0.0)
+                            self.state = "PARKING"
+                            stop_timer = now + PARK_TIME_ON_MARKER
+                        else:
+                            print(f"*** TARGET {target_node} SEEN ({aruco_size}px) - closing in ***")
+                            approach_start = now
+                            self.state = "APPROACHING"
                         break
 
                     if not heading_known:
@@ -1082,9 +1108,32 @@ class ArtProject:
                             ROBOT_HEADING = desired_heading
                             pre_turn_start = now
                             turned_since_prev_node = True   # skip re-sync at the next node (this turn is intentional)
+                            last_accepted_marker_time = now  # restart the "lost" clock for the post-turn leg
                             self.state = "ADVANCING_TO_TURN"
 
                     break
+
+                # ---------------- DRIFTED / OVERSHOT GUARD ----------------
+                # FOLLOWING with a target, heading known, line present, but no
+                # accepted marker for MARKER_TIMEOUT_S -> we've left the grid or
+                # driven past the target with nothing to stop us. Halt and report.
+                if (self.state in ("FOLLOWING", "APPROACHING") and heading_known
+                        and last_accepted_marker_time is not None
+                        and (now - last_accepted_marker_time) > MARKER_TIMEOUT_S):
+                    with self._lock:
+                        _tgt = self.target_node
+                    if _tgt is not None:
+                        print(f"!!! No marker for {now - last_accepted_marker_time:.1f}s while navigating "
+                              f"to {_tgt} - lost / overshot.")
+                        frodo.control.setTrackSpeed(0.0, 0.0)
+                        gx, gy, gpsi = self.pose_est.get()
+                        self.frodo.communication.send_event('art_project', {
+                            'type': 'error',
+                            'data': {'type': 'LOST', 'message': 'no marker seen for too long - lost or overshot',
+                                     'pose': {'x': float(gx), 'y': float(gy), 'psi': float(gpsi), 'time': time.time()}},
+                        })
+                        STOP_REASON = "LOST"
+                        self.state = "STOPPED"
 
                 # ================= LINE FOLLOWING =================
                 if self.state in ("FOLLOWING", "APPROACHING"):
@@ -1161,29 +1210,14 @@ class ArtProject:
                             })
 
                     if self.state == "APPROACHING":
-                        # Only used for the target marker (see the TARGET REACHED
-                        # decision) - since it's one-shot, the EKF-drift risk that
-                        # exists for intermediate turns doesn't apply here.
-                        if pending_node_xy is None:
-                            dist_to_node = 0.0     # not in MARKER_WORLD_MAP - apply immediately
-                        else:
-                            dist_to_node = float(np.hypot(pending_node_xy[0] - pose_x, pending_node_xy[1] - pose_y))
-
                         approach_elapsed = now - approach_start
-                        cv2.putText(display_frame, f"APPROACHING TARGET {dist_to_node:.2f}m",
+                        cv2.putText(display_frame, f"APPROACHING {approach_target_size}px",
                                     (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
-
                         if (now - last_approach_log) > 0.3:
                             last_approach_log = now
-                            print(f"  [APPROACH {approach_elapsed:.2f}s] target_xy={pending_node_xy} "
-                                  f"ekf=({pose_x:+.2f},{pose_y:+.2f}) distance={dist_to_node:.3f}m")
+                            print(f"  [APPROACH {approach_elapsed:.2f}s] target marker {approach_target_id} "
+                                  f"size={approach_target_size}px (arrive at {ARRIVE_MARKER_SIZE_PX})")
 
-                        # Once the line is lost, the robot is already stopped (setTrackSpeed(0,0)
-                        # above) - in that case the EKF distance also stops changing, so it may
-                        # never drop below ARRIVE_DISTANCE_M and we'd wait uselessly until
-                        # APPROACH_TIMEOUT (6s) (observed in the field: "DESTINATION REACHED"
-                        # was delayed by 3-5s). If the robot is REALLY not moving (line lost),
-                        # call it "arrived" after a short grace period instead - waiting longer buys nothing.
                         if line_detected:
                             approach_line_lost_since = None
                             stalled = False
@@ -1192,22 +1226,20 @@ class ArtProject:
                                 approach_line_lost_since = now
                             stalled = (now - approach_line_lost_since) > APPROACH_STALL_GRACE
 
-                        arrived = dist_to_node <= ARRIVE_DISTANCE_M
+                        on_marker = approach_target_size >= ARRIVE_MARKER_SIZE_PX
                         timed_out = approach_elapsed > APPROACH_TIMEOUT
-                        if timed_out and not arrived:
-                            print(f"!!! APPROACH TIMEOUT ({APPROACH_TIMEOUT}s) - EKF distance stayed at "
-                                  f"{dist_to_node:.3f}m, stopping anyway")
-                        elif stalled and not arrived:
-                            print(f"Line lost, robot stopped ({dist_to_node:.3f}m) - wait ended early")
+                        if timed_out and not on_marker:
+                            print(f"!!! APPROACH TIMEOUT ({APPROACH_TIMEOUT}s) - marker only got to "
+                                  f"{approach_target_size}px, parking anyway")
+                        elif stalled and not on_marker:
+                            print(f"Line lost, robot stopped (marker {approach_target_size}px) - parking now")
 
-                        if arrived or timed_out or stalled:
-                            print(f"*** MARKER CENTER REACHED ({dist_to_node:.3f}m). "
-                                  f"Parking for {PARKING_TIME}s ***")
+                        if on_marker or timed_out or stalled:
+                            _pt = PARK_TIME_ON_MARKER if on_marker else PARKING_TIME
+                            print(f"*** MARKER REACHED ({approach_target_size}px). Parking {_pt}s ***")
                             frodo.control.setTrackSpeed(0.0, 0.0)
                             self.state = "PARKING"
-                            stop_timer = time.time() + PARKING_TIME
-                            pending_action = None
-                            pending_node_xy = None
+                            stop_timer = now + _pt
                             approach_line_lost_since = None
 
                 # ================= SHORT STRAIGHT ADVANCE TO INTERSECTION =================
