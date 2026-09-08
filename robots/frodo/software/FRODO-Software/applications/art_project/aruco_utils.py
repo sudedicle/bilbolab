@@ -17,8 +17,25 @@ ARUCO_SCAN_Y_MIN = 0.10
 
 def create_aruco_detector(dict_type=ARUCO_DICT_TYPE):
     aruco_dictionary = aruco.getPredefinedDictionary(dict_type)
-    aruco_detector_params = aruco.DetectorParameters()
-    return aruco.ArucoDetector(aruco_dictionary, aruco_detector_params)
+    p = aruco.DetectorParameters()
+
+    # Tuned for small + slightly-blurry markers: on the 120deg-lens robots a
+    # mid-cell floor marker is only ~50-60 px, and with any softness the default
+    # params miss it (2026-09-08 frodo1 logs). These help borderline markers
+    # decode WITHOUT loosening the error-correction / border gates (which would
+    # turn floor texture into false IDs - a wrong node fix breaks navigation).
+    p.minMarkerPerimeterRate = 0.02           # default 0.03 - accept slightly smaller markers
+    p.polygonalApproxAccuracyRate = 0.06      # default 0.03 - tolerate blurry/rounded corners
+    p.adaptiveThreshWinSizeMax = 43           # default 23 - soft edges / uneven light
+    p.adaptiveThreshWinSizeStep = 10
+    p.perspectiveRemovePixelPerCell = 8       # default 4 - more samples per bit when decoding
+    try:
+        p.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+        p.cornerRefinementWinSize = 5
+    except AttributeError:
+        pass
+
+    return aruco.ArucoDetector(aruco_dictionary, p)
 
 
 def detect_markers(aruco_detector, gray_frame, scan_y_min_ratio=ARUCO_SCAN_Y_MIN):
