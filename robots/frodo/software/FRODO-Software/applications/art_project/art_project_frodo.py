@@ -133,12 +133,9 @@ ARUCO_LOG_PERIOD = 0.5     # log a marker at most twice per second
 # with a protractor/compass after changing this and adjust again if needed.
 TURN_ANGLE = np.radians(96.0)   # commanded relative turn per grid turn (was 105 - frodo1
                                 # over-rotated ~108deg and left the new line behind it)
-# Per-robot TURN_ANGLE override (deg). 2026-09-08: frodo1 (kp=2.2 gains + good RADIUS
-# calibration) physically rotated ~108deg on a 105deg command, i.e. it tracks the
-# command closely - so give it a near-true right angle.
-TURN_ANGLE_OVERRIDES_DEG = {
-    "frodo1": 92.0,
-}
+# Per-robot TURN_ANGLE override (deg). Empty - frodo1 now runs the SAME turn tuning
+# as frodo4 (the aggressive kp=2.2 override below was the reason it over-rotated).
+TURN_ANGLE_OVERRIDES_DEG = {}
 TURN_KP = 1.6               # rad/s per rad of error - bumped up, turn was too gentle and lost the line
 TURN_KI = 0.4                # integral gain - overcomes friction/static error
 TURN_I_LIMIT = 0.5           # clamp on the integral term's contribution (rad/s)
@@ -146,18 +143,13 @@ TURN_OMEGA_MAX = 1.4         # max angular speed allowed while turning (rad/s)
 TURN_TOLERANCE = np.radians(4.0)   # tolerance for "reached the target"
 TURN_SETTLE_TIME = 0.15      # stay within tolerance this long before calling the turn done (noise rejection)
 
-# Per-robot override for the turn PI gains above. TURN_KP/TURN_KI were tuned once in
-# the field and applied globally to every robot, but real motor/wheel/friction
-# differences between physical units mean one shared gain doesn't fit all - 2026-09-07
-# field test: frodo4 turns corners cleanly on the defaults, frodo1 visibly turns
-# weaker/undershoots with the SAME gains. Override per robot ID here instead of
-# bumping the global default (that would also change frodo4, which already works).
-# These are a first guess (not field-measured) - watch frodo1 turn and re-tune: still
-# weak/slow to converge -> raise "kp" further; oscillates/overshoots past the target
-# -> back "kp" off and/or raise "ki" instead.
-TURN_GAIN_OVERRIDES = {
-    "frodo1": {"kp": 2.2, "ki": 0.6},   # was kp=1.6 ki=0.4 (the global default)
-}
+# Per-robot override for the turn PI gains. Empty for now - frodo1's old
+# {kp:2.2, ki:0.6} was a never-field-measured guess from when it had a gray
+# camera and couldn't line-follow at all; once it actually turned (2026-09-08)
+# those gains made it OVER-rotate ~108deg and lose the new line. frodo1 now runs
+# the shared TURN_KP/TURN_KI, same as frodo4. Re-add an entry only after
+# measuring a real per-robot difference with a protractor.
+TURN_GAIN_OVERRIDES = {}
 
 # After a turn/park decision is made, the robot keeps driving STRAIGHT (WITHOUT
 # looking at the image) for this long, open-loop - so it ends up at the exact
