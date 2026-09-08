@@ -303,6 +303,11 @@ class ArtProject:
         # immediately on start. A robot with no entry there stays put (target None)
         # until the host calls go_to_position().
         self.target_node = TEST_TARGET_BY_ROBOT.get(frodo.common.id)
+        if self.target_node is not None and tuple(self.target_node) not in CITY_MAP.values():
+            frodo.logger.error(
+                f"TEST_TARGET_BY_ROBOT[{frodo.common.id!r}] = {self.target_node} is not a grid node "
+                f"(cols 0-{GRID_COLS - 1}, rows 0-{GRID_ROWS - 1}) - ignoring, robot will wait for go_to_position()")
+            self.target_node = None
         self.stopped = False              # manual halt-in-place, set by stop()
         self._manual_servo_request = False
 
