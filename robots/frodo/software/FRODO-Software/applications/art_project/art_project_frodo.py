@@ -143,13 +143,12 @@ TURN_OMEGA_MAX = 1.4         # max angular speed allowed while turning (rad/s)
 TURN_TOLERANCE = np.radians(4.0)   # tolerance for "reached the target"
 TURN_SETTLE_TIME = 0.15      # stay within tolerance this long before calling the turn done (noise rejection)
 
-# Per-robot override for the turn PI gains. Empty for now - frodo1's old
-# {kp:2.2, ki:0.6} was a never-field-measured guess from when it had a gray
-# camera and couldn't line-follow at all; once it actually turned (2026-09-08)
-# those gains made it OVER-rotate ~108deg and lose the new line. frodo1 now runs
-# the shared TURN_KP/TURN_KI, same as frodo4. Re-add an entry only after
-# measuring a real per-robot difference with a protractor.
-TURN_GAIN_OVERRIDES = {}
+# Per-robot override for the turn PI gains. frodo1's motors/wheels turn weaker
+# than frodo4's, so it needs a higher proportional gain to rotate briskly enough
+# not to lose the line mid-turn. ki is left at the shared default.
+TURN_GAIN_OVERRIDES = {
+    "frodo1": {"kp": 2.2},
+}
 
 # After a turn/park decision is made, the robot keeps driving STRAIGHT (WITHOUT
 # looking at the image) for this long, open-loop - so it ends up at the exact
