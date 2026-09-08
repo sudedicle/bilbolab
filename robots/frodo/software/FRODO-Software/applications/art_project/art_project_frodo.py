@@ -5,8 +5,9 @@
 #  software/robots/frodo/applications/artproject/application_artproject.py):
 #  go_to_position, stop, get_pose, get_status - names/payloads kept 1:1 compatible so
 #  ArtProject_Application/ArtProject_FRODO on the host can drive this robot unchanged.
-#  trigger_servo is an extra, FRODO-specific command (no host-side equivalent - the
-#  metronome servo also triggers automatically off ArUco IDs, see SERVO_TRIGGER_IDS).
+#  trigger_servo is an extra, FRODO-specific command (no host-side equivalent). The
+#  metronome servo otherwise cycles automatically on arrival at the target node
+#  (SERVO_ON_ARRIVAL) - the metronome device sits ON that grid node.
 #
 #  Navigation itself is still grid/line-based (not free x,y driving), so
 #  go_to_position() snaps the requested world (x, y) to the nearest known grid node
@@ -37,41 +38,17 @@ from grid_nav import grid_nodes, next_heading, direction_between, DIRECTIONS
 from path_planner import plan_cooperative_paths
 from peer_sync import PeerSync
 
-# --- SERVO TRIGGER (on specific ArUco IDs) ---
+# --- SERVO ---
+# The metronome device is placed at a plain grid NODE. The robot navigates there
+# with the normal floor markers (CITY_MAP, 0-53), parks on the node's marker, and
+# cycles the servo in place (see the PARKING/DONE block). There is NO special
+# floor marker for the servo any more - the old 995-999 "metronome trigger"
+# markers are now robot BODY markers (see ROBOT_BODY_MARKERS below).
 # First verify the pin/servo with servo_test.py.
 SERVO_PIN = 19                 # BCM GPIO19 - verified with the servo_pin_scan.py sweep
 SERVO_ANGLE_HOME = 0
 SERVO_ANGLE_TRIGGER = 90
-SERVO_TRIGGER_IDS = {999, 998, 997, 996, 995}  # seeing one of these IDs triggers the servo action
-SERVO_FORWARD_DURATION = 1.5   # seconds - drive straight this long after the servo turns, then rotate_to_home()
-SERVO_RETRIGGER_COOLDOWN = 5.0 # so passing the same marker doesn't retrigger it over and over
-# When a marker is first seen, the robot is not yet lined up with it (the camera
-# sees it ahead of time) - close this distance open-loop (without looking at the
-# image) before triggering the servo. Measure in the field and adjust as needed.
-SERVO_TRIGGER_APPROACH_DISTANCE_M = 0.2
-# 2026-09-07 field test: the raw ArUco detector occasionally misreads noise as a
-# fake marker ID (observed: 656, 470, 944, 246, 190, 382, 549, 394 - none of these
-# are real markers anywhere in this app). Unlike CITY_MAP node acceptance (which
-# requires ARUCO_MIN_SIZE_PX=160px), the servo trigger had NO size check at all - a
-# noise ID that happened to land on 995-999 would have fired the servo with zero
-# validation. Observed noise topped out at 50px, real trigger-distance detections
-# were 90-180px - this sits with margin in between.
-SERVO_TRIGGER_MIN_SIZE_PX = 70
-
-# hoca's ACTUAL target points (2026-09-07): each metronome marker sits ON a path
-# LINE - i.e. at the midpoint of an EDGE between two adjacent CITY_MAP nodes, not
-# on a node itself (row is a whole grid step, col is X.5) - field-measured, in grid
-# units (already divided by GRID_CELL_M, same units as CITY_MAP). See
-# METRONOME_TARGET_NODES below (defined after world_to_grid_node()) for the node
-# each one snaps to - same rounding go_to_position() would apply if the host sends
-# these as real-world (x, y) instead.
-METRONOME_MARKER_GRID_POS = {
-    995: (2.5, 0.0),
-    996: (5.5, 2.0),
-    997: (7.5, 3.0),
-    998: (5.5, 4.0),
-    999: (3.5, 5.0),
-}
+SERVO_ON_ARRIVAL = True         # cycle the servo automatically on arrival at the target node
 
 # --- ARUCO FILTERS ---
 # The DECISION (direction/target) is made as soon as a marker is ACCEPTED - but
@@ -238,30 +215,16 @@ def world_to_grid_node(x: float, y: float) -> tuple[int, int]:
     return col, row
 
 
-# marker_id -> nearest CITY_MAP node, from METRONOME_MARKER_GRID_POS above - same
-# round()+clamp world_to_grid_node() would apply if the host sent these as real
-# (x, y) meters instead. NOTE: each marker sits on an EDGE (col is X.5), so this
-# is one of its TWO adjacent nodes, picked by Python's round-half-to-even (e.g.
-# 2.5 -> 2, 3.5 -> 4) - if a marker should instead be approached from the OTHER
-# side, override that entry by hand.
-METRONOME_TARGET_NODES = {
-    marker_id: (
-        max(0, min(GRID_COLS - 1, int(round(gx)))),
-        max(0, min(GRID_ROWS - 1, int(round(gy)))),
-    )
-    for marker_id, (gx, gy) in METRONOME_MARKER_GRID_POS.items()
-}
-
-# Body markers per robot (robot/definitions.py -> ARUCO_SETTINGS_*). These are
-# the VERTICAL markers on the robot bodies; they are detected by frodo.sensors
-# (the floor grid has its own separate detector, see aruco_utils.py). Kept in
-# the 900s so they never collide with the floor grid (0-53) or the metronome
-# servo triggers (995-999).
+# Body markers per robot - the VERTICAL ArUco markers stuck on the robot bodies,
+# used only for multi-robot collision avoidance (detected via frodo.sensors; the
+# floor grid has its own separate detector, see aruco_utils.py). These IDs are
+# NOT in CITY_MAP so the grid navigation ignores them ("NOT ON MAP"). Only the
+# robots actually in use need an entry.
+# 2026-09-08: reusing the old 995-999 sheets - frodo1 wears 995 (front) + 996
+# (back), frodo4 wears 997 (front) + 998 (back).
 ROBOT_BODY_MARKERS = {
-    "frodo1": {900, 901},
-    "frodo2": {902, 903},
-    "frodo3": {904, 905},
-    "frodo4": {906, 907},
+    "frodo1": {995, 996},
+    "frodo4": {997, 998},
 }
 # Right-of-way: earlier = higher priority. A higher-priority robot ignores the
 # others and drives its own shortest path. A lower-priority robot, when it sees
@@ -270,17 +233,14 @@ ROBOT_BODY_MARKERS = {
 # EMERGENCY stop below still applies to every robot regardless of priority.
 ROBOT_PRIORITY = ["frodo1", "frodo2", "frodo3", "frodo4"]
 
-# TEMPORARY for field testing without a host/hub connection (see self.target_node
-# below) - which metronome marker's node each robot heads for when no go_to_position()
-# has been called yet.
-# 2026-09-07 field test: frodo1 placed at (2,0), frodo4 placed at (0,0) - NOT
-# frodo1/frodo2 (the file's own placeholder default before today). Targets picked
-# so neither equals its own start (frodo1 starts ON 995's node - giving it that as
-# a target would mean "don't move") and the two paths cross rather than one just
-# chasing the other. Change freely for a different pairing/robots.
+# Field-testing target node per robot, used when no go_to_position() has arrived
+# over WiFi (SSH-run standalone). The metronome device sits ON this grid node -
+# the robot drives here with the floor markers, parks, and cycles the servo.
+# (col, row); CITY_MAP id = row * GRID_COLS + col.  Edit freely per test.
+# 2026-09-08: metronome at marker id 9 = (0,1) for frodo1, id 28 = (1,3) for frodo4.
 TEST_TARGET_BY_ROBOT = {
-    "frodo1": METRONOME_TARGET_NODES[999],   # (2, 0) -> (4, 5)
-    "frodo4": METRONOME_TARGET_NODES[997],   # (0, 0) -> (8, 3)
+    "frodo1": (0, 1),   # CITY_MAP id 9
+    "frodo4": (1, 3),   # CITY_MAP id 28
 }
 
 # Another robot seen closer than *_BLOCK_DISTANCE_M and within +-*_AHEAD_BEARING
@@ -311,7 +271,7 @@ class ArtProject:
 
     Extra, FRODO-specific command (no host-side equivalent):
       - trigger_servo(): manually cycle the metronome servo, independent of position
-        (the servo also triggers automatically off ArUco IDs - see SERVO_TRIGGER_IDS)
+        (it otherwise cycles automatically on arrival at the target node)
 
     All hardware access (motors, servo, camera) happens exclusively on the run()
     loop thread. The WiFi-invoked methods above only set/read plain attributes
@@ -328,12 +288,10 @@ class ArtProject:
         self.current_node = None          # last grid node confirmed by a marker read
 
         # --- shared state (written by WiFi commands, read by run()) ---
-        # TEMPORARY for field testing without a host/hub connection - remove once
-        # go_to_position() is actually being called over WiFi, this bypasses that
-        # entirely and starts the robot heading here immediately. Now points at a
-        # real target (a metronome marker's node, see TEST_TARGET_BY_ROBOT above)
-        # instead of the old arbitrary (5, 3).
-        self.target_node = TEST_TARGET_BY_ROBOT.get(frodo.common.id, METRONOME_TARGET_NODES[995])
+        # Field-testing target (see TEST_TARGET_BY_ROBOT) - the robot heads here
+        # immediately on start. A robot with no entry there stays put (target None)
+        # until the host calls go_to_position().
+        self.target_node = TEST_TARGET_BY_ROBOT.get(frodo.common.id)
         self.stopped = False              # manual halt-in-place, set by stop()
         self._manual_servo_request = False
 
@@ -345,55 +303,23 @@ class ArtProject:
         # --- ArUco detector ---
         self.aruco_detector = create_aruco_detector(ARUCO_DICT_TYPE)
 
-        # --- servo trigger (SERVO_TRIGGER_IDS -> rotate 90 degrees -> forward -> rotate back) ---
+        # --- servo (cycled in place on arrival at the target node) ---
         # Fall back to a no-op servo if the hardware isn't wired up / provisioned
         # yet (missing rpi_hardware_pwm or the config.txt PWM overlay) - the grid
         # navigation and ArUco logic still run, the servo just doesn't move.
         try:
             # self.servo = NullServo()
-            # self.servo = HardwareServo(pin=SERVO_PIN, min_pulse_ms=0.15, max_pulse_ms=2.5)
-
             self.servo = HardwareServo(pin=SERVO_PIN)
-
         except (ImportError, ModuleNotFoundError, FileNotFoundError, OSError) as e:
             frodo.logger.warning(f"HardwareServo unavailable ({e}) - using NullServo (servo will not move)")
             self.servo = NullServo()
-        # Auto servo-trigger fires ONLY on THIS robot's own assigned metronome
-        # marker (the one whose node is our current target), not on any 995-999
-        # marker seen along the way - the mission is "reach YOUR marker, then run
-        # the servo". If the target isn't one of the metronome nodes (host sent an
-        # arbitrary go_to_position), there's no auto trigger - arrival at the
-        # target node still fires the servo (see the PARKING/DONE block).
-        self._assigned_metronome_id = next(
-            (mid for mid, node in METRONOME_TARGET_NODES.items() if node == self.target_node), None)
-        _auto_trigger_ids = {self._assigned_metronome_id} if self._assigned_metronome_id is not None else set()
-
-        # The metronome marker sits at the MIDPOINT of an edge, not on a node (e.g.
-        # 997 is at (7.5, 3.0), between nodes (7,3) and (8,3)). Navigating to the
-        # rounded node and firing the servo there triggers it ~14 cm short of the
-        # actual marker (seen in the field). So: the two nodes the marker's edge
-        # connects are BOTH acceptable "entry" nodes - reaching either one, the
-        # robot then drives ACROSS that edge to the other node, passing directly
-        # over the marker at the midpoint where the auto-trigger fires. If it
-        # crosses the whole edge without seeing the marker, the servo fires at the
-        # far node as a fallback (see the PARKING/DONE block).
-        self._metronome_pair = None
-        self._metronome_crossing = False
-        if self._assigned_metronome_id is not None:
-            _mx, _my = METRONOME_MARKER_GRID_POS[self._assigned_metronome_id]
-            if _mx != int(_mx):
-                self._metronome_pair = ((int(_mx), int(_my)), (int(_mx) + 1, int(_my)))
-            elif _my != int(_my):
-                self._metronome_pair = ((int(_mx), int(_my)), (int(_mx), int(_my) + 1))
-        frodo.logger.info(f"Assigned metronome marker: {self._assigned_metronome_id} "
-                          f"(target node {self.target_node}, edge nodes {self._metronome_pair})")
+        # No auto-trigger any more (no floor marker for the servo) - trigger_ids is
+        # empty, the object is kept only for its rotate_to_trigger()/rotate_to_home()
+        # mechanics, used on target arrival and by the manual trigger_servo() command.
         self.servo_trigger = ArucoServoTrigger(
             self.servo, frodo.control.setTrackSpeed,
-            trigger_ids=_auto_trigger_ids,
+            trigger_ids=set(),
             angle_home=SERVO_ANGLE_HOME, angle_trigger=SERVO_ANGLE_TRIGGER,
-            forward_speed=0.08, forward_duration=SERVO_FORWARD_DURATION,
-            approach_distance_m=SERVO_TRIGGER_APPROACH_DISTANCE_M,
-            cooldown=SERVO_RETRIGGER_COOLDOWN,
         )
 
         # --- pose estimation (EKF: prediction + ArUco correction) ---
@@ -745,14 +671,6 @@ class ArtProject:
         pre_turn_start = None
         advance_time_this_turn = ADVANCE_TIME   # per-turn (shorter at grid boundaries)
 
-        # SERVO_APPROACHING/SERVO_ADVANCING: starts once the servo trigger ID is seen
-        # (see the SERVO_* constants above). Same idea as ADVANCING_TO_TURN - open-loop
-        # driving, but ArUco scanning/grid decisions KEEP RUNNING during this too (see
-        # the widened status check below) - in the field, the earlier design (which
-        # blocked the whole action in one go) made the robot miss the next grid marker
-        # during its ~4s of blind driving and navigate to the wrong place.
-        servo_phase_start = None
-
         turn_start = None
         turn_last_time = None
         turn_i_acc = 0.0
@@ -840,8 +758,7 @@ class ArtProject:
                 # while driving forward in a corridor; the short in-place TURNING
                 # states are left alone so the psi PI controller isn't disturbed.
                 if self.state in ("FOLLOWING", "APPROACHING", "ADVANCING_TO_TURN",
-                                  "ADVANCING_FROM_TURN", "PARKING",
-                                  "SERVO_APPROACHING", "SERVO_ADVANCING") \
+                                  "ADVANCING_FROM_TURN", "PARKING") \
                         and self._robot_emergency_ahead():
                     frodo.control.setTrackSpeed(0.0, 0.0)
                     cv2.putText(display_frame, "ROBOT AHEAD - HOLDING", (30, 150),
@@ -869,25 +786,10 @@ class ArtProject:
                     if not detected_markers:
                         print(f"[{now:.1f}] ArUco: none visible")
 
-                # ---------------- SERVO TRIGGER (SERVO_TRIGGER_IDS, automatic) ----------------
-                # Independent of grid navigation: these IDs aren't in CITY_MAP so they
-                # never enter the decision loop below, which is why it's checked
-                # separately and first. Only triggers while driving straight
-                # (FOLLOWING) - so it doesn't clash with the robot's position/speed
-                # during a turn/park/approach.
+                # ---------------- MANUAL SERVO TRIGGER (from the host) ----------------
+                # The servo otherwise only fires on arrival at the target node
+                # (PARKING/DONE block) - there is no floor marker for it any more.
                 if self.state == "FOLLOWING":
-                    detected_ids_now = [
-                        detected_id for detected_id, marker_corners in detected_markers
-                        if marker_bbox(marker_corners)[-1] >= SERVO_TRIGGER_MIN_SIZE_PX
-                    ]
-                    servo_matched_id = self.servo_trigger.matching_id(detected_ids_now, now)
-                    if servo_matched_id is not None:
-                        print(f"[{now:.1f}] Trigger ArUco ID seen: {servo_matched_id} - approaching marker")
-                        self.servo_trigger.mark_triggered(now)
-                        servo_phase_start = now
-                        self.state = "SERVO_APPROACHING"
-
-                    # ---------------- MANUAL SERVO TRIGGER (from the host) ----------------
                     with self._lock:
                         manual_request = self._manual_servo_request
                         if manual_request:
@@ -917,10 +819,7 @@ class ArtProject:
                         status = "NOT ON MAP"
                     elif detected_id == LAST_SEEN_ID:
                         status = "already processed"
-                    elif self.state not in ("FOLLOWING", "SERVO_APPROACHING", "SERVO_ADVANCING"):
-                        # SERVO_APPROACHING/SERVO_ADVANCING included: don't miss a grid
-                        # decision even while driving open-loop for the servo (see the
-                        # servo_phase_start note above).
+                    elif self.state != "FOLLOWING":
                         status = f"state={self.state}"
                     else:
                         status = "ACCEPTED"
@@ -1015,14 +914,8 @@ class ArtProject:
                             turned_since_prev_node = False
 
                     # ---------------- DECISION MAKING ----------------
-                    # Only ACT on a decision while actually FOLLOWING. Position/heading
-                    # tracking above still runs during SERVO_APPROACHING/SERVO_ADVANCING
-                    # (so we don't miss it), but enacting a decision here would overwrite
-                    # self.state (to APPROACHING or ADVANCING_TO_TURN) mid-servo-sequence,
-                    # permanently hijacking it away before it ever reaches rotate_to_home()
-                    # - observed in the field: servo triggered and stayed open because a
-                    # different grid marker was seen while driving the open-loop
-                    # SERVO_ADVANCING leg. Defer any real decision until back in FOLLOWING.
+                    # Only ACT on a decision while actually FOLLOWING (position/heading
+                    # tracking above already ran).
                     if self.state != "FOLLOWING":
                         break
 
@@ -1033,24 +926,7 @@ class ArtProject:
                     if target_node is None:
                         break
 
-                    # Reached an entry node of the metronome's edge - don't park here,
-                    # redirect to the OTHER end so the next leg runs ALONG the edge,
-                    # straight over the marker (auto-trigger fires at the midpoint).
-                    # Re-decide THIS frame (don't break) - the marker is still in view
-                    # so the turn onto the edge happens now, not after driving blind.
-                    if (self._metronome_pair is not None and not self._metronome_crossing
-                            and current_coord in self._metronome_pair):
-                        other_end = (self._metronome_pair[1] if current_coord == self._metronome_pair[0]
-                                     else self._metronome_pair[0])
-                        print(f"*** Reached metronome edge at {current_coord} - crossing to {other_end} "
-                              f"to pass marker {self._assigned_metronome_id} ***")
-                        self._metronome_crossing = True
-                        with self._lock:
-                            self.target_node = other_end
-                        target_node = other_end
-                        # fall through to the turn/continue decision with the new target
-
-                    elif current_coord == target_node:
+                    if current_coord == target_node:
                         print(f"*** TARGET NODE SEEN - approaching marker center before parking ***")
                         pending_action = "TARGET"
                         pending_node_xy = MARKER_WORLD_MAP.get(detected_id)
@@ -1408,48 +1284,6 @@ class ArtProject:
                         turn_exit_centered_since = None
                         turn_exit_sweep_start = None
 
-                # ================= SERVO: APPROACHING THE MARKER (automatic) =================
-                # Same open-loop idea as ADVANCING_TO_TURN (driving WITHOUT looking at
-                # the image, just a fixed forward speed) - the difference: ArUco
-                # scanning/grid decisions KEEP RUNNING during this too (see the widened
-                # status check above), the servo itself hasn't moved yet.
-                elif self.state == "SERVO_APPROACHING":
-                    servo_elapsed = now - servo_phase_start
-                    frodo.control.setTrackSpeed(self.servo_trigger.forward_speed, self.servo_trigger.forward_speed)
-                    cv2.putText(display_frame, f"SERVO APPROACH {servo_elapsed:.1f}s",
-                                (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
-
-                    if servo_elapsed >= self.servo_trigger.approach_time:
-                        print(f"Reached the metronome ({servo_elapsed:.2f}s) -> triggering servo")
-                        frodo.control.setTrackSpeed(0.0, 0.0)
-                        time.sleep(self.servo_trigger.pre_stop_delay)   # robot is STOPPED - covers no distance
-                        self.servo_trigger.rotate_to_trigger()          # blocking, short (~settle_time), robot stopped
-                        servo_phase_start = now
-                        self.state = "SERVO_ADVANCING"
-
-                # ================= SERVO: SHORT FORWARD AFTER TRIGGERING (automatic) =================
-                elif self.state == "SERVO_ADVANCING":
-                    servo_elapsed = now - servo_phase_start
-                    frodo.control.setTrackSpeed(self.servo_trigger.forward_speed, self.servo_trigger.forward_speed)
-                    cv2.putText(display_frame, f"SERVO FORWARD {servo_elapsed:.1f}s",
-                                (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
-
-                    if servo_elapsed >= self.servo_trigger.forward_duration:
-                        frodo.control.setTrackSpeed(0.0, 0.0)
-                        self.servo_trigger.rotate_to_home()             # blocking, short (~settle_time), robot stopped
-                        self.frodo.communication.send_event('art_project_servo_triggered', {'node': self.current_node})
-                        # trigger_ids only holds our OWN assigned metronome marker, so
-                        # getting here means we reached it -> mission complete. Clear
-                        # the target unconditionally (it may still point at the far
-                        # edge node we were crossing toward) so DONE doesn't treat it
-                        # as a fresh go_to_position() and resume.
-                        arrived_node = self.current_node
-                        self._metronome_crossing = False
-                        with self._lock:
-                            self.target_node = None
-                        print(">>> SERVO ACTION COMPLETE - MISSION COMPLETE, holding until a new go_to_position().")
-                        self.state = "DONE"
-
                 # ================= SHORT STRAIGHT ADVANCE AT THE TARGET =================
                 # Same idea as ADVANCING_TO_TURN: drive forward at a fixed speed
                 # without looking at the image for PARKING_TIME, then stop - so we end
@@ -1464,28 +1298,21 @@ class ArtProject:
                         arrived_node = arriving_node
                         arriving_node = None
 
-                        _metronome_mission = self._assigned_metronome_id is not None
-                        if _metronome_mission:
-                            # Fallback: we drove the whole metronome edge without the
-                            # auto-trigger seeing the marker (blur / missed it) - fire
-                            # the servo here at the far node. Robot is stopped, so the
-                            # cycle covers no distance.
-                            print(f"\n*** ARRIVED at metronome node {arrived_node} without a marker "
-                                  f"sighting - triggering servo (fallback) ***")
+                        if SERVO_ON_ARRIVAL:
+                            # The metronome device sits on this node - cycle the servo
+                            # in place (robot is stopped, covers no distance), then hold.
+                            print(f"\n*** ARRIVED at target {arrived_node} - triggering servo ***")
                             self.servo_trigger.rotate_to_trigger()
                             self.servo_trigger.rotate_to_home()
                             self.frodo.communication.send_event('art_project_servo_triggered',
                                                                 {'node': list(arrived_node) if arrived_node else None})
 
-                        self._metronome_crossing = False
                         with self._lock:
-                            # Metronome mission is over regardless; for a plain host
-                            # target only clear it if unchanged.
-                            if _metronome_mission or self.target_node == arrived_node:
+                            if self.target_node == arrived_node:
                                 self.target_node = None
-                        self.state = "DONE" if _metronome_mission else "FOLLOWING"
+                        self.state = "DONE" if SERVO_ON_ARRIVAL else "FOLLOWING"
                         print("*** MISSION COMPLETE - holding until a new go_to_position(). ***"
-                              if _metronome_mission else
+                              if SERVO_ON_ARRIVAL else
                               "\n*** ARRIVED. Resuming line following, waiting for next go_to_position(). ***")
                         arrived_pose_x, arrived_pose_y, arrived_pose_psi = self.pose_est.get()
                         arrived_target = None
