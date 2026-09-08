@@ -28,8 +28,13 @@ def get_color_mask(frame, target_color):
         lower_bound = np.array([140, 50, 50])
         upper_bound = np.array([179, 255, 255])
     elif target_color == "green":
-        lower_bound = np.array([40, 100, 100])
-        upper_bound = np.array([80, 255, 255])
+        # S/V floors were 100 (vs pink's 50), much stricter - 2026-09-08 field
+        # logs: the robot follows pink lines and re-acquires them after a turn
+        # fine, but every turn onto a GREEN (N-S) line failed to find it and it
+        # got lost. Under blur / this lighting the green stripe's pixels sit
+        # around S~60-90 / V~80-120 and were being rejected. Loosen to pink-like.
+        lower_bound = np.array([38, 45, 45])
+        upper_bound = np.array([90, 255, 255])
     elif target_color == "blue":
         lower_bound = np.array([100, 100, 100])
         upper_bound = np.array([130, 255, 255])

@@ -173,8 +173,10 @@ TURN_GAIN_OVERRIDES = {
 # wrong way (the old design used line-following here and that caused a "two-step"
 # wobble).
 ADVANCE_TIME = 1.0   # seconds
-ADVANCE_TIME_BOUNDARY = 0.3   # shorter pre-turn advance when the cell ahead is off the grid
-                              # (a full ADVANCE_TIME would drive past the grid edge)
+ADVANCE_TIME_BOUNDARY = 0.7   # shorter pre-turn advance when the cell ahead is off the grid
+                              # (a full ADVANCE_TIME would drive past the grid edge) - but not
+                              # SO short that the robot pivots before reaching the intersection
+                              # and can't reach the new line (2026-09-08: 0.3s left it short at (8,1))
 
 # Marker ID -> grid coordinate. PLACEHOLDER: the real ID/coordinate mapping
 # will be assigned once the markers are placed in the field.
@@ -1357,7 +1359,7 @@ class ArtProject:
                         if turn_exit_sweep_start is None:
                             turn_exit_sweep_start = now
                         swept = now - turn_exit_sweep_start
-                        sweep_omega = 0.6 if swept < TURN_EXIT_SWEEP_TIME else -0.6
+                        sweep_omega = 0.45 if swept < TURN_EXIT_SWEEP_TIME else -0.45
                         vL_e, vR_e = calculate_wheel_speeds(0.0, sweep_omega, track_width)
                         frodo.control.setTrackSpeed(vL_e, vR_e)
                         cv2.putText(display_frame, "TURN EXIT - SEARCHING LINE", (10, 220),
