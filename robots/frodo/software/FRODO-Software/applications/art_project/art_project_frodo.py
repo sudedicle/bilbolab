@@ -90,6 +90,23 @@ ARUCO_MIN_SIZE_PX = 160    # markers smaller than this (i.e. far away) are NOT a
 ARUCO_X_MIN = 0.10         # left edge of the lane window
 ARUCO_X_MAX = 0.90         # right edge of the lane window
 
+# Per-robot override for ARUCO_MIN_SIZE_PX. The 160px default was measured on
+# frodo4, which has a 60deg lens (robot/definitions.py). frodo1/frodo2 have a
+# 120deg lens and frodo3 a 90deg lens, so the SAME marker at the SAME distance
+# lands on far fewer pixels for them - with the 160px floor a wide-lens robot
+# almost never ACCEPTS a grid marker, so it never gets a position/heading fix and
+# navigates blind. Scale the floor by (robot_fov / 60deg): ~80px for the 120deg
+# robots, ~107px for the 90deg one. FIRST GUESS - watch the "size=NNNpx -> TOO FAR"
+# vs "-> ACCEPTED" console lines and adjust: still mostly TOO FAR at real
+# intersections -> lower further; accepting noise/markers from the next lane over
+# -> raise. The real fix is a matching narrow lens + re-calibration; this just
+# makes the wide lens usable.
+ARUCO_MIN_SIZE_PX_OVERRIDES = {
+    "frodo1": 80,
+    "frodo2": 80,
+    "frodo3": 107,
+}
+
 ARRIVE_DISTANCE_M = 0.06   # "arrived" once the EKF (x,y) is this close (m) to the target marker's world position
 APPROACH_TIMEOUT = 6.0     # safety net: stop anyway if we haven't arrived within this time
 APPROACH_STALL_GRACE = 0.5 # if the line has been lost this long (robot already stopped), call it "arrived" right away
@@ -189,6 +206,8 @@ GRID_COLS = 9
 GRID_ROWS = 6
 GRID_NODES = grid_nodes(GRID_COLS, GRID_ROWS)
 
+_OPPOSITE_HEADING = {"EAST": "WEST", "WEST": "EAST", "NORTH": "SOUTH", "SOUTH": "NORTH"}
+
 
 def grid_node_to_world(node: tuple[int, int]) -> tuple[float, float]:
     """Grid (col, row) -> world (x, y) meters. Same formula as MARKER_WORLD_MAP /
@@ -265,6 +284,7 @@ OTHER_ROBOT_AHEAD_BEARING = np.radians(45)
 # =====================================================================================
 class ArtProject:
     """
+
     Line-following + ArUco grid-navigation + servo-trigger agent.
 
     WiFi command surface matches hoca's host protocol (application_artproject.py /
@@ -601,6 +621,13 @@ class ArtProject:
         if _turn_gain:
             print(f"Turn gains (override for {frodo.common.id!r}): kp={turn_kp} ki={turn_ki}")
 
+        # This robot's ArUco accept threshold - see ARUCO_MIN_SIZE_PX_OVERRIDES
+        # above (per-robot, defaults to ARUCO_MIN_SIZE_PX if no override).
+        aruco_min_size_px = ARUCO_MIN_SIZE_PX_OVERRIDES.get(frodo.common.id, ARUCO_MIN_SIZE_PX)
+        if aruco_min_size_px != ARUCO_MIN_SIZE_PX:
+            print(f"ArUco accept threshold (override for {frodo.common.id!r}): {aruco_min_size_px}px "
+                  f"(default {ARUCO_MIN_SIZE_PX}px)")
+
         # ROBOT_HEADING is NOT guessed/assumed - it's derived from the robot's own
         # first two marker fixes (see HEADING CALIBRATION below), so it's correct
         # regardless of which physical direction the robot happens to be facing
@@ -799,7 +826,7 @@ class ArtProject:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
                     # --- filter decision ---
-                    if center_y < ARUCO_Y_MIN * h_img or aruco_size < ARUCO_MIN_SIZE_PX:
+                    if center_y < ARUCO_Y_MIN * h_img or aruco_size < aruco_min_size_px:
                         status = "TOO FAR"
                     elif center_x < ARUCO_X_MIN * w_img or center_x > ARUCO_X_MAX * w_img:
                         status = "WRONG LANE"
@@ -960,6 +987,48 @@ class ArtProject:
 
                     print(f"Heading: {ROBOT_HEADING} -> Desired: {desired_heading}")
 
+                    # ---------------- 180 degree ("wrong way on this axis") handling ----------------
+                    # The robot can't pivot 180 in place on the line (and a blind
+                    # 180 loses the line entirely). If BFS wants a full reversal -
+                    # e.g. dropped facing WEST but the target is EAST - turn 90
+                    # toward whichever perpendicular axis moves us CLOSER to the
+                    # target; the remaining 90 is taken at a later node once the
+                    # robot is heading along the perpendicular. If the target is
+                    # dead behind on this exact axis (no perpendicular reduces the
+                    # distance), still turn 90 toward any in-grid perpendicular
+                    # neighbor so the robot works its way around instead of driving
+                    # off the end of the row/column.
+                    if desired_heading == _OPPOSITE_HEADING.get(ROBOT_HEADING):
+                        cx, cy = current_coord
+                        tx, ty = target_node
+                        if ROBOT_HEADING in ("EAST", "WEST"):
+                            if ty > cy:
+                                options = ["NORTH", "SOUTH"]
+                            elif ty < cy:
+                                options = ["SOUTH", "NORTH"]
+                            else:
+                                options = ["NORTH", "SOUTH"]
+                        else:
+                            if tx > cx:
+                                options = ["EAST", "WEST"]
+                            elif tx < cx:
+                                options = ["WEST", "EAST"]
+                            else:
+                                options = ["EAST", "WEST"]
+                        detour_heading = None
+                        for cand in options:
+                            cdx, cdy = DIRECTIONS[cand]
+                            if (cx + cdx, cy + cdy) in GRID_NODES:
+                                detour_heading = cand
+                                break
+                        if detour_heading is None:
+                            print(f"!!! 180 required at {current_coord} and no in-grid "
+                                  f"perpendicular neighbor - staying put")
+                            break
+                        print(f"  [180] reversal needed ({ROBOT_HEADING} -> {desired_heading}); "
+                              f"turning {detour_heading} now, remaining turn at the next node")
+                        desired_heading = detour_heading
+
                     if ROBOT_HEADING == desired_heading:
                         print("Action: CONTINUE")
                     else:
@@ -982,7 +1051,11 @@ class ArtProject:
                             pre_turn_next_state = "TURNING_LEFT"
                             print("Action: TURN LEFT (after short advance)")
                         else:
-                            print("!!! 180 degree turn required - not supported")
+                            # Should be unreachable: a true reversal is rewritten to a
+                            # 90 degree detour above, and every remaining (heading,
+                            # desired) pair is a left or right quarter turn.
+                            print(f"!!! Unexpected turn {ROBOT_HEADING} -> {desired_heading} "
+                                  f"- not supported, staying put")
                             pre_turn_next_state = None
 
                         if pre_turn_next_state is not None:
