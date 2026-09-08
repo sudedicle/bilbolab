@@ -89,13 +89,47 @@ def direction_between(a: tuple[int, int], b: tuple[int, int]) -> str:
     return _STEP_TO_DIR[step]
 
 
-def next_heading(start, goal, nodes, blocked=None):
-    """Cardinal direction of the FIRST step of the shortest path start->goal.
-    Returns None if start == goal or no path exists."""
-    path = shortest_path(start, goal, nodes, blocked)
-    if path is None or len(path) < 2:
+def _dist_map(goal, nodes, blocked):
+    """BFS flood from `goal`: {node: steps to reach goal}, over `nodes` minus
+    `blocked` (goal itself always reachable)."""
+    blocked = set(blocked or ())
+    blocked.discard(goal)
+    dist = {goal: 0}
+    frontier = deque([goal])
+    while frontier:
+        cur = frontier.popleft()
+        for nb in neighbors(cur, nodes):
+            if nb in dist or nb in blocked:
+                continue
+            dist[nb] = dist[cur] + 1
+            frontier.append(nb)
+    return dist
+
+
+def next_heading(start, goal, nodes, blocked=None, prefer=None):
+    """Cardinal direction of the FIRST step toward `goal` on a MINIMUM-LENGTH
+    path. Among the (possibly several) first steps that stay on a shortest path,
+    keep going `prefer` (the robot's current heading) if that is one of them -
+    this yields the fewest-turns route (drive straight until in line with the
+    target, then turn once) instead of a staircase. Returns None if start==goal
+    or unreachable."""
+    if start == goal:
         return None
-    return direction_between(path[0], path[1])
+    dist = _dist_map(goal, nodes, blocked)
+    if start not in dist:
+        return None
+    d0 = dist[start]
+    blocked = set(blocked or ())
+    on_path = []                      # first-step directions that stay on a shortest path
+    for name, (dx, dy) in DIRECTIONS.items():
+        nb = (start[0] + dx, start[1] + dy)
+        if nb in nodes and nb not in blocked and dist.get(nb, 1 << 30) == d0 - 1:
+            on_path.append(name)
+    if not on_path:
+        return None
+    if prefer in on_path:
+        return prefer
+    return on_path[0]
 
 
 def turn_for(current_heading: str, desired_heading: str) -> str:

@@ -1011,13 +1011,14 @@ class ArtProject:
                             print(f"  [cooperative] yielding at {current_coord} - routing around {wait_cell}")
 
                         desired_heading = next_heading(current_coord, target_node, GRID_NODES,
-                                                       blocked=blocked_cells)
+                                                       blocked=blocked_cells, prefer=ROBOT_HEADING)
                         if desired_heading is None and blocked_cells:
                             # No detour exists (rare on an open grid). Fall back to the
                             # unblocked shortest path - the EMERGENCY stop still keeps
                             # the robots from actually touching.
                             print("  [avoidance] no detour - holding to shortest path, emergency-stop will guard")
-                            desired_heading = next_heading(current_coord, target_node, GRID_NODES)
+                            desired_heading = next_heading(current_coord, target_node, GRID_NODES,
+                                                           prefer=ROBOT_HEADING)
                         if desired_heading is None:
                             print(f"!!! No path from {current_coord} to {target_node} - staying put")
                             break

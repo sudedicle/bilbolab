@@ -171,6 +171,13 @@ def _space_time_astar(start, goal, nodes, reserved_cells, reserved_edges, max_ti
         if t >= max_time:
             continue
 
+        # direction we arrived on `node` by (for the tiny turn penalty below)
+        prev_state = came_from[state]
+        in_dir = None
+        if prev_state is not None:
+            pn = prev_state[0]
+            in_dir = (node[0] - pn[0], node[1] - pn[1])
+
         candidates = [node] + list(neighbors(node, nodes))  # wait, or move
         for nxt in candidates:
             nxt_t = t + 1
@@ -179,7 +186,13 @@ def _space_time_astar(start, goal, nodes, reserved_cells, reserved_edges, max_ti
                 continue
             if nxt != node and (node, nxt, t) in reserved_edges:
                 continue  # someone else crosses this edge the other way during [t, t+1]
-            tentative_g = g_score[state] + 1
+            # +1 per step, plus a tiny penalty for changing direction so that among
+            # equal-length routes the straightest (fewest-turns) one wins - too
+            # small to ever make a longer path preferred.
+            move_dir = (nxt[0] - node[0], nxt[1] - node[1])
+            turn_pen = 0.001 if (in_dir is not None and move_dir != (0, 0)
+                                 and in_dir != (0, 0) and move_dir != in_dir) else 0.0
+            tentative_g = g_score[state] + 1 + turn_pen
             if nxt_state not in g_score or tentative_g < g_score[nxt_state]:
                 g_score[nxt_state] = tentative_g
                 came_from[nxt_state] = state
