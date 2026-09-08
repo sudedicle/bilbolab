@@ -638,6 +638,15 @@ class ArtProject:
         LAST_SEEN_ID = None
         first_fix_coord = None     # grid coord of the very first marker seen
         heading_known = False      # True once ROBOT_HEADING has been derived from 2 real fixes
+        # Continuous heading re-sync (see HEADING CALIBRATION below): ROBOT_HEADING
+        # is dead-reckoned (only updated at turns) and psi is odometry-only, so a
+        # slipped wheel, an imperfect turn, or the robot being physically picked up
+        # and moved silently desyncs it - after which the robot drives the wrong
+        # way, still "confirming" its stale heading. While FOLLOWING the robot can
+        # ONLY move straight along a line, so any two consecutive node fixes with no
+        # turn between them give the TRUE travel direction - use that to correct.
+        prev_node_for_heading = None
+        turned_since_prev_node = False
         line_lost_since = None     # FOLLOWING only - see LINE_LOST_CREEP_TIME above
         line_lost_reported = False # so the one-shot LINE_LOST error event below doesn't spam every frame
 
@@ -904,8 +913,32 @@ class ArtProject:
                                         ROBOT_HEADING = "NORTH" if dyr > 0 else "SOUTH"
                                     CURRENT_TARGET_COLOR = "pink" if ROBOT_HEADING in ("EAST", "WEST") else "green"
                                     heading_known = True
+                                    prev_node_for_heading = current_coord
+                                    turned_since_prev_node = False
                                     print(f"Heading calibrated from real movement {first_fix_coord} -> "
                                           f"{current_coord}: {ROBOT_HEADING} (color={CURRENT_TARGET_COLOR})")
+                        else:
+                            # ---------------- CONTINUOUS HEADING RE-SYNC ----------------
+                            # Heading already known. If we reached this node on a
+                            # STRAIGHT run (no turn since the previous node fix), the
+                            # node-to-node delta is the real heading - snap to it if it
+                            # disagrees with the dead-reckoned ROBOT_HEADING.
+                            if prev_node_for_heading is not None and not turned_since_prev_node:
+                                hdx = current_coord[0] - prev_node_for_heading[0]
+                                hdy = current_coord[1] - prev_node_for_heading[1]
+                                if hdx != 0 or hdy != 0:
+                                    if abs(hdx) >= abs(hdy):
+                                        observed = "EAST" if hdx > 0 else "WEST"
+                                    else:
+                                        observed = "NORTH" if hdy > 0 else "SOUTH"
+                                    if observed != ROBOT_HEADING:
+                                        print(f"  [heading re-sync] {prev_node_for_heading} -> "
+                                              f"{current_coord} = {observed}, was {ROBOT_HEADING} - correcting")
+                                        ROBOT_HEADING = observed
+                                        CURRENT_TARGET_COLOR = ("pink" if observed in ("EAST", "WEST")
+                                                                else "green")
+                            prev_node_for_heading = current_coord
+                            turned_since_prev_node = False
 
                     # ---------------- DECISION MAKING ----------------
                     # Only ACT on a decision while actually FOLLOWING. Position/heading
@@ -1072,6 +1105,7 @@ class ArtProject:
                             # instead of repeatedly flagging the unsupported 180 turn.
                             ROBOT_HEADING = desired_heading
                             pre_turn_start = now
+                            turned_since_prev_node = True   # skip re-sync at the next node (this turn is intentional)
                             self.state = "ADVANCING_TO_TURN"
 
                     break
