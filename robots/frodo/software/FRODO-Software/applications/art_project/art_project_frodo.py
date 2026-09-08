@@ -1185,12 +1185,26 @@ class ArtProject:
                     # an actual failure (not every frame), so it can't reintroduce the
                     # per-frame flip-flop the LAST_SEEN_ID gating above was written to
                     # avoid.
-                    if not line_detected and not heading_known:
+                    # Current colour lost - try the OTHER colour. When heading isn't
+                    # known yet any visible line will do (initial guess). When it IS
+                    # known, only switch if the other colour shows a CLEAR line (area
+                    # well over the noise floor) - that means the robot is physically
+                    # on the perpendicular lane, i.e. ROBOT_HEADING / colour desynced
+                    # (seen after an imperfect turn: sitting on the pink E-W line but
+                    # looking for green). Switch and force a heading re-sync at the
+                    # next node. The "clear line" bar keeps this from flip-flopping.
+                    if not line_detected:
                         other_color = "green" if CURRENT_TARGET_COLOR == "pink" else "pink"
                         other_found = find_line(get_color_mask(frame, other_color))
-                        if other_found is not None:
-                            print(f"  [color] {CURRENT_TARGET_COLOR} lost, heading not yet "
-                                  f"known - switching to {other_color}")
+                        _clear = other_found is not None and (not heading_known or other_found[1] > 3000)
+                        if _clear:
+                            if heading_known:
+                                print(f"  [colour] {CURRENT_TARGET_COLOR} lost but a clear {other_color} "
+                                      f"line is here - heading/colour desynced, switching + will re-sync")
+                                turned_since_prev_node = False   # let the next node fix ROBOT_HEADING
+                            else:
+                                print(f"  [colour] {CURRENT_TARGET_COLOR} lost, heading not yet known "
+                                      f"- switching to {other_color}")
                             CURRENT_TARGET_COLOR = other_color
                             mask = get_color_mask(frame, CURRENT_TARGET_COLOR)
                             error, line_detected, _area = calculate_deviation(mask, display_frame)
