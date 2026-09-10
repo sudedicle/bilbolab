@@ -91,7 +91,8 @@ def direction_between(a: tuple[int, int], b: tuple[int, int]) -> str:
 
 def _dist_map(goal, nodes, blocked):
     """BFS flood from `goal`: {node: steps to reach goal}, over `nodes` minus
-    `blocked` (goal itself always reachable)."""
+    `blocked` (goal itself always reachable). Kept for the __main__ demo / any
+    caller that wants the raw distance field; next_heading() no longer uses it."""
     blocked = set(blocked or ())
     blocked.discard(goal)
     dist = {goal: 0}
@@ -107,29 +108,24 @@ def _dist_map(goal, nodes, blocked):
 
 
 def next_heading(start, goal, nodes, blocked=None, prefer=None):
-    """Cardinal direction of the FIRST step toward `goal` on a MINIMUM-LENGTH
-    path. Among the (possibly several) first steps that stay on a shortest path,
-    keep going `prefer` (the robot's current heading) if that is one of them -
-    this yields the fewest-turns route (drive straight until in line with the
-    target, then turn once) instead of a staircase. Returns None if start==goal
-    or unreachable."""
+    """Cardinal direction of the FIRST step toward `goal`, on a fewest-turns
+    shortest path found by A* (path_planner.astar_next_step - Manhattan heuristic,
+    search state = (node, incoming step), tiny per-turn penalty). `prefer` (the
+    robot's current heading) seeds that incoming step so continuing straight is
+    free -> the robot drives straight along one axis until in line with the
+    target, then turns once, instead of a staircase. `blocked` nodes are routed
+    around (higher-priority robot in the cell ahead). Returns None if start==goal
+    or unreachable.
+
+    A* lives in path_planner.py (which imports from this module) - imported lazily
+    here to avoid a circular import at load time."""
     if start == goal:
         return None
-    dist = _dist_map(goal, nodes, blocked)
-    if start not in dist:
+    from path_planner import astar_next_step
+    path = astar_next_step(start, goal, nodes, blocked=blocked, prefer=prefer)
+    if not path or len(path) < 2:
         return None
-    d0 = dist[start]
-    blocked = set(blocked or ())
-    on_path = []                      # first-step directions that stay on a shortest path
-    for name, (dx, dy) in DIRECTIONS.items():
-        nb = (start[0] + dx, start[1] + dy)
-        if nb in nodes and nb not in blocked and dist.get(nb, 1 << 30) == d0 - 1:
-            on_path.append(name)
-    if not on_path:
-        return None
-    if prefer in on_path:
-        return prefer
-    return on_path[0]
+    return direction_between(path[0], path[1])
 
 
 def turn_for(current_heading: str, desired_heading: str) -> str:

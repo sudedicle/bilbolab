@@ -110,7 +110,13 @@ def calculate_deviation(mask, frame):
     return error, True, area
 
 
-def proportional_controller(error, kp, base_speed):
+def proportional_controller(error, kp, base_speed, d_error=0.0, kd=0.0):
+    """P (or PD) steering. error = pixel offset of the line from image centre.
+    d_error = d(error)/dt in px/s (0 disables the D term). The D term damps the
+    left-right weave you get from a pure-P controller with camera/actuation lag,
+    especially right after a turn when the robot enters the line at an angle:
+    P alone only sees the offset, drives to null it, overshoots, and oscillates;
+    kd*d_error opposes the rate of change and settles it."""
     abs_error = abs(error)
 
     if abs_error > 120:
@@ -120,7 +126,7 @@ def proportional_controller(error, kp, base_speed):
     else:
         forward_speed = base_speed
 
-    angular_speed = float(np.clip(-kp * error, -MAX_OMEGA, MAX_OMEGA))
+    angular_speed = float(np.clip(-kp * error - kd * d_error, -MAX_OMEGA, MAX_OMEGA))
     return forward_speed, angular_speed
 
 

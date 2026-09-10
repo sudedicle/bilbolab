@@ -40,143 +40,65 @@ from peer_sync import PeerSync
 
 # --- SERVO ---
 # The metronome device is placed at a plain grid NODE. The robot navigates there
-# with the normal floor markers (CITY_MAP, 0-53); the moment the TARGET marker is
-# ACCEPTED it opens the servo (starts the metronome), keeps line-following slowly
-# forward for SERVO_OPEN_DRIVE_TIME, then closes the servo, stops, and reports
-# MISSION COMPLETE (see the METRONOME state in run()). There is NO special floor
-# marker for the servo any more - the old 995-999 "metronome trigger" markers are
-# now robot BODY markers (see ROBOT_BODY_MARKERS below).
+# with the normal floor markers (CITY_MAP, 0-53), parks on the node's marker, and
+# cycles the servo in place (see the PARKING/DONE block). There is NO special
+# floor marker for the servo any more - the old 995-999 "metronome trigger"
+# markers are now robot BODY markers (see ROBOT_BODY_MARKERS below).
 # First verify the pin/servo with servo_test.py.
 SERVO_PIN = 19                 # BCM GPIO19 - verified with the servo_pin_scan.py sweep
 SERVO_ANGLE_HOME = 0
 SERVO_ANGLE_TRIGGER = 90
-SERVO_ON_ARRIVAL = True         # open the servo (metronome) automatically on arrival at the target node
-SERVO_OPEN_DRIVE_TIME = 1.5     # after the target marker is ACCEPTED: keep line-following slowly
-                                # forward with the servo OPEN this long (metronome runs), then
-                                # close the servo, stop, and report MISSION COMPLETE.
+SERVO_ON_ARRIVAL = True         # cycle the servo automatically on arrival at the target node
 
-# =====================================================================================
-#  PER-ROBOT TUNING  -  the ONE place for every value that differs between robots.
-#
-#  TUNING_DEFAULTS = the shared baseline. ROBOT_TUNING[<id>] overrides individual
-#  keys for that robot; anything it doesn't list falls back to TUNING_DEFAULTS.
-#  run() reads the merged dict once as `tune` (= TUNING_DEFAULTS + ROBOT_TUNING[id]).
-#
-#  To bring a new robot online: add a ROBOT_TUNING entry with ONLY the keys that
-#  need to differ (usually aruco_min_size_px for its lens FOV, turn_kp for its
-#  motor strength, sometimes advance_time). Watch the console on the first run
-#  ("Per-robot tuning for ...", "size=NNNpx -> TOO FAR / ACCEPTED", turn logs) and
-#  adjust. Constants NOT in this dict (TURN_OMEGA_MAX, TURN_TOLERANCE, ADVANCE
-#  speeds, MARKER_TIMEOUT_S, ...) are the same for every robot.
-# =====================================================================================
-TUNING_DEFAULTS = {
-    # --- ArUco grid-marker acceptance ---
-    # Markers smaller than this (= further away) are NOT accepted for a
-    # position/heading fix or a turn decision. 160 was measured on frodo4's 60deg
-    # lens (robot/definitions.py); a wider lens puts the same marker on fewer
-    # pixels, so those robots need a lower floor (roughly 160 * fov_deg / 60).
-    # Too high -> mostly "TOO FAR" at real intersections, robot navigates blind.
-    # Too low  -> accepts noise / a marker in the next lane over.
-    "aruco_min_size_px": 160,
+# --- ARUCO FILTERS ---
+# The DECISION (direction/target) is made as soon as a marker is ACCEPTED - but
+# it isn't APPLIED right away, the robot first drives straight for ADVANCE_TIME
+# (see ADVANCING_TO_TURN/PARKING below). These two solve different problems:
+# decisions used to be made way too early, because ARUCO_Y_MIN=0.15 was loose
+# enough that a marker got ACCEPTED while still in the middle of the path
+# (observed in the field: decided at size~80-100px, even though a marker at an
+# intersection could grow to 150-170px) - fixed by adding a hard floor on pixel
+# SIZE (ARUCO_MIN_SIZE_PX). The decision now fires at the right time, but the
+# robot may not physically be at the exact center of the intersection/marker yet
+# - that last step is finished by ADVANCE_TIME (driving straight open-loop,
+# WITHOUT looking at the image).
+ARUCO_Y_MIN = 0.15         # markers below this height are "too far away"
+ARUCO_MIN_SIZE_PX = 160    # markers smaller than this (i.e. far away) are NOT accepted
+ARUCO_X_MIN = 0.10         # left edge of the lane window
+ARUCO_X_MAX = 0.90         # right edge of the lane window
 
-    # ArUco ACCEPT window (fractions of the frame). A grid marker the robot should
-    # read is directly ahead => LOW in the frame (big center_y) and near the
-    # horizontal centre. A marker one row/column over sits HIGHER and/or off to the
-    # side. On a wide (120deg) lens those adjacent markers are still well inside a
-    # loose window and get mistaken for the current node -> wrong position / wrong
-    # heading calibration (frodo1 read (7,2) instead of (6,3)). Tighten per robot:
-    #   aruco_y_min  - reject anything ABOVE this height (further away / next row)
-    #   aruco_x_min/max - reject anything outside this horizontal band (next lane)
-    "aruco_y_min": 0.15,
-    "aruco_x_min": 0.10,
-    "aruco_x_max": 0.90,
+# Per-robot override for ARUCO_MIN_SIZE_PX. The 160px default was measured on
+# frodo4, which has a 60deg lens (robot/definitions.py). frodo1/frodo2 have a
+# 120deg lens and frodo3 a 90deg lens, so the SAME marker at the SAME distance
+# lands on far fewer pixels for them - with the 160px floor a wide-lens robot
+# almost never ACCEPTS a grid marker, so it never gets a position/heading fix and
+# navigates blind. Scale the floor by (robot_fov / 60deg): ~80px for the 120deg
+# robots, ~107px for the 90deg one. FIRST GUESS - watch the "size=NNNpx -> TOO FAR"
+# vs "-> ACCEPTED" console lines and adjust: still mostly TOO FAR at real
+# intersections -> lower further; accepting noise/markers from the next lane over
+# -> raise. The real fix is a matching narrow lens + re-calibration; this just
+# makes the wide lens usable.
+# LINE-LOST COMPARISON: no per-robot override - both frodo1 and frodo4 use the
+# shared ARUCO_MIN_SIZE_PX (160) so the mission is identical and any difference
+# in marker acceptance / LINE LOST comes only from the camera/optics.
+ARUCO_MIN_SIZE_PX_OVERRIDES = {}
 
-    # --- closed-loop turning (EKF psi + PI) ---
-    # turn_angle_deg = the RELATIVE angle commanded per grid turn. >90 on purpose:
-    # the drive undershoots a true right angle. Re-measure with a protractor after
-    # changing and adjust.
-    "turn_angle_deg": 96.0,
-    "turn_kp": 1.6,            # rad/s per rad of error
-    "turn_ki": 0.4,            # integral gain (overcomes friction / static error)
+# Arrival at the target node is judged by the TARGET MARKER's pixel SIZE, not the
+# EKF distance - the EKF drifts badly without frequent fixes (2026-09-08: it sat
+# ~0.2 m off and never converged, so the robot "arrived" a whole node past the
+# target). Once the target marker is seen this big it is right under the robot.
+ARRIVE_MARKER_SIZE_PX = 130
+APPROACH_TIMEOUT = 5.0     # safety net: stop anyway if the marker never gets big enough
+APPROACH_STALL_GRACE = 0.5 # if the line has been lost this long (robot already stopped), call it "arrived" right away
+PARK_TIME_ON_MARKER = 0.4  # short forward settle when we're already on the marker (vs PARKING_TIME from farther out)
 
-    # --- open-loop advance to the intersection centre BEFORE a pivot ---
-    # After the turn marker is ACCEPTED the robot keeps driving straight (open-loop,
-    # not looking at the image) for advance_time, THEN pivots - so it ends up on the
-    # node instead of turning early (the accept threshold fires while the marker is
-    # still ~a node away). advance_time_boundary is used instead when the cell
-    # straight ahead is off the grid (grid edge) so it doesn't drive off the end.
-    # 1.8 was tuned on frodo1 (80px far-accept); a robot that accepts the marker
-    # closer needs less - override per robot.
-    "advance_time": 1.8,
-    "advance_time_boundary": 0.9,
-
-    # --- "lost / overshot" guard ---
-    # Give up (FAILED: NO MARKERS) after driving this far since the last ACCEPTED
-    # marker while navigating to a target. Must exceed the longest gap between two
-    # readable markers on a route - a narrow-lens / soft-focus robot that skips
-    # intermediate node markers needs more (the final leg to the target can be 3
-    # cells = ~0.86 m).
-    "marker_lost_dist_m": 0.9,
-
-    # --- line following / drive ---
-    "line_kp": 0.008,         # steering P-gain (px error -> omega)
-    "line_kd": 0.0015,        # steering D-gain (px/s -> omega) - damps the left-right
-                              # weave after a turn. Raise if it still weaves, lower if
-                              # steering feels twitchy / jerky. 0 = pure P (old behaviour).
-    "base_speed": 0.08,       # forward speed while following / advancing (m/s)
-    "track_width": 0.150,     # wheel separation (m) - physically per-robot
-}
-
-ROBOT_TUNING = {
-    "frodo1": {
-        # Deliberately IDENTICAL to frodo4 (user's call, for an apples-to-apples run).
-        # NOTE: frodo1 physically has a 120deg lens vs frodo4's 60deg, so it may
-        # still read the next row/column's marker as "this node" - if it does, put
-        # aruco_y_min ~0.45 / aruco_x_min-max 0.30-0.70 back here.
-        "aruco_min_size_px": 140,
-        "turn_kp": 2.0,
-        "turn_angle_deg": 104.0,
-        "advance_time": 1.6,
-        "advance_time_boundary": 0.4,
-        "marker_lost_dist_m": 1.3,
-    },
-    "frodo2": {
-        "aruco_min_size_px": 80,     # 120deg lens
-    },
-    "frodo3": {
-        "aruco_min_size_px": 107,    # 90deg lens
-    },
-    "frodo4": {
-        "aruco_min_size_px": 140,
-        "turn_kp": 1.8,
-        "turn_angle_deg": 130.0,    # 96 under-rotated - frodo4 ended the pivot short of the new
-                                    # line and lost it. Raise until it lands ON the line (watch the
-        "advance_time": 1.6,
-        "advance_time_boundary": 0.4,
-        "marker_lost_dist_m": 1.3,
-    },
-    # "frodo5": { ... add its entry here ... },
-}
-
-
-def tuning_for(robot_id):
-    """TUNING_DEFAULTS with this robot's ROBOT_TUNING overrides merged on top.
-    Unknown robot id -> plain defaults."""
-    merged = dict(TUNING_DEFAULTS)
-    merged.update(ROBOT_TUNING.get(robot_id, {}))
-    return merged
-
-
-# (The ArUco ACCEPT window - aruco_y_min / aruco_x_min / aruco_x_max - and the
-#  size floor aruco_min_size_px are all per-robot: see the PER-ROBOT TUNING block.)
-
-# Navigating with a target but NO accepted marker after driving marker_lost_dist_m
-# (per-robot, see TUNING_DEFAULTS) since the last one => drifted off the grid /
-# overshot with nothing to stop it. Distance-based, not time-based, so it does NOT
-# false-fire on a robot that is merely slow to reach the next marker. A narrow-lens
-# robot that can't read every intermediate marker on a straight leg needs a bigger
-# budget (the final target leg can be 3 cells = ~0.86 m).
-MARKER_TIMEOUT_S = 30.0   # backstop for a robot stuck not moving and seeing nothing (shared)
+# Navigating with a target but NO accepted marker after driving this far since the
+# last one => drifted off the grid / overshot with nothing to stop it (seen in the
+# field: drove into a wall past the target). Distance-based, not time-based, so it
+# does NOT false-fire on a robot that is merely slow to reach the next marker -
+# ~2.5 grid cells (GRID_CELL_M = 0.286).
+MARKER_LOST_DIST_M = 0.75
+MARKER_TIMEOUT_S = 30.0   # backstop for a robot stuck not moving and seeing nothing
 
 # In FOLLOWING (a plain pass-through node, not the final target), a hard stop
 # the instant the line is lost can permanently strand the robot: an ArUco card
@@ -194,18 +116,47 @@ LINE_LOST_CREEP_TIME = 1.0
 # (markers are never expected in the top part anyway).
 ARUCO_LOG_PERIOD = 0.5     # log a marker at most twice per second
 
-# --- CLOSED-LOOP TURNING (EKF psi feedback), values shared by every robot ---
-# Instead of a blind timed turn, we turn a relative +-turn_angle_deg (per-robot,
-# see TUNING_DEFAULTS) from whatever psi actually reads when the turn starts, with
-# a PI controller (see the turn-start block below for why this is relative rather
-# than an absolute EAST=0/NORTH=90/.. target - psi is odometry-only and drifts
-# over a multi-leg run). The turn PI gains (turn_kp / turn_ki) and the pre-pivot
-# advance (advance_time / advance_time_boundary) are ALSO per-robot - see the
-# PER-ROBOT TUNING block above. Only the limits below are the same for all robots.
+# --- CLOSED-LOOP TURNING (EKF psi feedback) ---
+# Instead of a blind timed turn, we turn a relative +-TURN_ANGLE from whatever
+# psi actually reads when the turn starts, with a PI controller (see the
+# turn-start block below for why this is relative rather than an absolute
+# EAST=0/NORTH=90/.. target - psi is odometry-only and drifts over a
+# multi-leg run).
+# TURN_ANGLE is NOT 90deg on purpose: field-measured actual rotation for a
+# commanded 90deg came out ~85deg (RADIUS calibration still undershoots a
+# bit), so we command more than a true right angle to compensate. Re-measure
+# with a protractor/compass after changing this and adjust again if needed.
+TURN_ANGLE = np.radians(96.0)   # commanded relative turn per grid turn (was 105 - frodo1
+                                # over-rotated ~108deg and left the new line behind it)
+# LINE-LOST COMPARISON: no per-robot TURN_ANGLE override - both robots use the
+# shared TURN_ANGLE (96 deg).
+TURN_ANGLE_OVERRIDES_DEG = {}
+TURN_KP = 1.6               # rad/s per rad of error - bumped up, turn was too gentle and lost the line
+TURN_KI = 0.4                # integral gain - overcomes friction/static error
 TURN_I_LIMIT = 0.5           # clamp on the integral term's contribution (rad/s)
 TURN_OMEGA_MAX = 1.4         # max angular speed allowed while turning (rad/s)
 TURN_TOLERANCE = np.radians(4.0)   # tolerance for "reached the target"
 TURN_SETTLE_TIME = 0.15      # stay within tolerance this long before calling the turn done (noise rejection)
+
+# LINE-LOST COMPARISON: no per-robot turn-gain override - both robots use the
+# shared TURN_KP (1.6) / TURN_KI so the mission is identical.
+TURN_GAIN_OVERRIDES = {}
+
+# After a turn/park decision is made, the robot keeps driving STRAIGHT (WITHOUT
+# looking at the image) for this long, open-loop - so it ends up at the exact
+# center of the intersection/marker. Now that ARUCO_MIN_SIZE_PX already makes the
+# decision fire close to the intersection (fixed the old "turning too early"
+# issue), this short advance is safe: since it never looks at the image at all,
+# there's no risk of intersection/marker contours steering line-following the
+# wrong way (the old design used line-following here and that caused a "two-step"
+# wobble).
+# 2026-09-08: 1.0s drove the robot a full ~8cm PAST the node before pivoting, so
+# the perpendicular line ended up BEHIND it (out of the forward camera) and the
+# turn-exit search never found it. With the low accept thresholds the marker is
+# already close when the decision fires, so a shorter advance lands the pivot on
+# the node.
+ADVANCE_TIME = 0.55   # seconds
+ADVANCE_TIME_BOUNDARY = 0.4   # shorter still when the cell ahead is off the grid
 
 # Marker ID -> grid coordinate. PLACEHOLDER: the real ID/coordinate mapping
 # will be assigned once the markers are placed in the field.
@@ -267,7 +218,12 @@ def world_to_grid_node(x: float, y: float) -> tuple[int, int]:
     return col, row
 
 
-# frodo1 wears 995 (front) + 996
+# Body markers per robot - the VERTICAL ArUco markers stuck on the robot bodies,
+# used only for multi-robot collision avoidance (detected via frodo.sensors; the
+# floor grid has its own separate detector, see aruco_utils.py). These IDs are
+# NOT in CITY_MAP so the grid navigation ignores them ("NOT ON MAP"). Only the
+# robots actually in use need an entry.
+# 2026-09-08: reusing the old 995-999 sheets - frodo1 wears 995 (front) + 996
 # (back), frodo4 wears 997 (front) + 998 (back).
 ROBOT_BODY_MARKERS = {
     "frodo1": {995, 996},
@@ -284,10 +240,12 @@ ROBOT_PRIORITY = ["frodo1", "frodo2", "frodo3", "frodo4"]
 # over WiFi (SSH-run standalone). The metronome device sits ON this grid node -
 # the robot drives here with the floor markers, parks, and cycles the servo.
 # (col, row); CITY_MAP id = row * GRID_COLS + col.  Edit freely per test.
-# 2026-09-08: metronome at marker id 9 = (0,1) for frodo1, id 28 = (1,3) for frodo4.
+# LINE-LOST COMPARISON: frodo1 and frodo4 run the IDENTICAL mission (same target
+# node, same gains) so any difference in LINE LOST behaviour comes only from the
+# camera/optics. Both robots drive to grid node (2, 4) = CITY_MAP id 38.
 TEST_TARGET_BY_ROBOT = {
-    "frodo1": (5, 2),   # CITY_MAP id
-    "frodo4": (7, 2),   # CITY_MAP id 38
+    "frodo1": (2, 4),   # CITY_MAP id 38
+    "frodo4": (2, 4),   # CITY_MAP id 38  - same as frodo1
 }
 
 # Another robot seen closer than *_BLOCK_DISTANCE_M and within +-*_AHEAD_BEARING
@@ -625,31 +583,30 @@ class ArtProject:
             self.peer_sync = None
 
         # ---------------- PARAMETERS ----------------
-        # Every per-robot value comes from the one PER-ROBOT TUNING block at the top
-        # (TUNING_DEFAULTS + ROBOT_TUNING[id]). Nothing per-robot is hard-coded here.
-        tune = tuning_for(frodo.common.id)
-        _overrides = ROBOT_TUNING.get(frodo.common.id, {})
-        if _overrides:
-            print(f"Per-robot tuning for {frodo.common.id!r}: "
-                  + ", ".join(f"{k}={tune[k]}" for k in sorted(_overrides)))
-        else:
-            print(f"Per-robot tuning for {frodo.common.id!r}: (none - using TUNING_DEFAULTS)")
-
         CURRENT_TARGET_COLOR = "pink"
-        kp = tune["line_kp"]
-        kd = tune["line_kd"]
-        base_speed = tune["base_speed"]
-        track_width = tune["track_width"]
-        turn_kp = tune["turn_kp"]
-        turn_ki = tune["turn_ki"]
-        turn_angle = np.radians(tune["turn_angle_deg"])
-        aruco_min_size_px = tune["aruco_min_size_px"]
-        aruco_y_min = tune["aruco_y_min"]
-        aruco_x_min = tune["aruco_x_min"]
-        aruco_x_max = tune["aruco_x_max"]
-        advance_time = tune["advance_time"]
-        advance_time_boundary = tune["advance_time_boundary"]
-        marker_lost_dist_m = tune["marker_lost_dist_m"]
+        kp = 0.008
+        base_speed = 0.08           # kept low for the straight-drive test
+        track_width = 0.150
+
+        # This robot's turn PI gains - see TURN_GAIN_OVERRIDES above (per-robot,
+        # defaults to the shared TURN_KP/TURN_KI if this robot has no override).
+        _turn_gain = TURN_GAIN_OVERRIDES.get(frodo.common.id, {})
+        turn_kp = _turn_gain.get("kp", TURN_KP)
+        turn_ki = _turn_gain.get("ki", TURN_KI)
+        if _turn_gain:
+            print(f"Turn gains (override for {frodo.common.id!r}): kp={turn_kp} ki={turn_ki}")
+
+        # This robot's commanded turn angle - see TURN_ANGLE_OVERRIDES_DEG above.
+        turn_angle = np.radians(TURN_ANGLE_OVERRIDES_DEG.get(frodo.common.id, np.degrees(TURN_ANGLE)))
+        if frodo.common.id in TURN_ANGLE_OVERRIDES_DEG:
+            print(f"Turn angle (override for {frodo.common.id!r}): {np.degrees(turn_angle):.0f} deg")
+
+        # This robot's ArUco accept threshold - see ARUCO_MIN_SIZE_PX_OVERRIDES
+        # above (per-robot, defaults to ARUCO_MIN_SIZE_PX if no override).
+        aruco_min_size_px = ARUCO_MIN_SIZE_PX_OVERRIDES.get(frodo.common.id, ARUCO_MIN_SIZE_PX)
+        if aruco_min_size_px != ARUCO_MIN_SIZE_PX:
+            print(f"ArUco accept threshold (override for {frodo.common.id!r}): {aruco_min_size_px}px "
+                  f"(default {ARUCO_MIN_SIZE_PX}px)")
 
         # ROBOT_HEADING is NOT guessed/assumed - it's derived from the robot's own
         # first two marker fixes (see HEADING CALIBRATION below), so it's correct
@@ -661,15 +618,17 @@ class ArtProject:
         LAST_SEEN_ID = None
         first_fix_coord = None     # grid coord of the very first marker seen
         heading_known = False      # True once ROBOT_HEADING has been derived from 2 real fixes
-        # ROBOT_HEADING is set once at calibration and then ONLY at an explicit turn
-        # (closed-loop psi PI, lands within ~2 deg every time). There is NO continuous
-        # node-to-node "re-sync" any more: it used to fire on diagonal / skipped-node
-        # reads ((3,2)->(2,3)) and "correct" the heading to a bogus value, which then
-        # triggered phantom 180 reversals and sent the robot staircasing off the grid.
+        # Continuous heading re-sync (see HEADING CALIBRATION below): ROBOT_HEADING
+        # is dead-reckoned (only updated at turns) and psi is odometry-only, so a
+        # slipped wheel, an imperfect turn, or the robot being physically picked up
+        # and moved silently desyncs it - after which the robot drives the wrong
+        # way, still "confirming" its stale heading. While FOLLOWING the robot can
+        # ONLY move straight along a line, so any two consecutive node fixes with no
+        # turn between them give the TRUE travel direction - use that to correct.
+        prev_node_for_heading = None
+        turned_since_prev_node = False
         line_lost_since = None     # FOLLOWING only - see LINE_LOST_CREEP_TIME above
         line_lost_reported = False # so the one-shot LINE_LOST error event below doesn't spam every frame
-        prev_line_error = None     # for the steering D term - reset to None whenever the line is
-        prev_line_error_t = 0.0    # not seen so a stale delta can't kick the wheels on re-acquire
 
         # TURNING pivots the robot roughly in place (no forward speed) - it does NOT
         # drive the robot onto the new-color lane by itself. Since the axis color is
@@ -698,29 +657,36 @@ class ArtProject:
         TURN_EXIT_BLIND_CREEP_TIME = 0.25  # brief blind creep off the pivot point first
         TURN_EXIT_STRAIGHT_TIME = 1.2      # then creep straight this long, hoping the line appears
         TURN_EXIT_SWEEP_TIME = 2.0         # then sweep +-this long each side to find it
-        TURN_EXIT_CENTER_PX = 25           # |error| under this = "centred enough" to start FOLLOWING
-                                           # (60 -> 40 -> 25: handing over further off the new line
-                                           #  meant FOLLOWING started from an angled pose and wove)
-        TURN_EXIT_CENTER_HOLD = 0.3        # ...for this long (0.2 -> 0.3: let the pose settle so
-                                           #  FOLLOWING starts roughly parallel, not mid-correction)
+        TURN_EXIT_CENTER_PX = 60           # |error| under this = "centred enough" to start FOLLOWING
+        TURN_EXIT_CENTER_HOLD = 0.2        # ...for this long
         turn_exit_start = None
         turn_exit_centered_since = None
         turn_exit_sweep_start = None
 
-        # METRONOME state: the target marker was ACCEPTED, the servo is OPEN and the
-        # robot line-follows slowly forward until this deadline, then closes the
-        # servo, stops, and goes DONE (see the METRONOME branch in LINE FOLLOWING).
-        metronome_close_time = 0.0
-        arriving_node = None          # grid node currently being arrived at (METRONOME)
+        # Once we decide "arrived" at the target, the robot keeps driving straight
+        # OPEN-LOOP (without looking at the image) for PARKING_TIME before stopping -
+        # so it ends up at the exact center of the marker (see the ADVANCE_TIME note above).
+        PARKING_TIME = ADVANCE_TIME + 0.2
+        stop_timer = 0
+
+        # APPROACHING state: the target node's marker has been seen but from too far
+        # (small) - keep line-following straight at it until the marker grows to
+        # ARRIVE_MARKER_SIZE_PX (we're on it), then PARKING.
+        approach_start = None
+        last_approach_log = 0.0
+        approach_line_lost_since = None
+        approach_target_id = None     # CITY_MAP id of the marker we're closing on
+        approach_target_size = 0      # its latest pixel size
+        arriving_node = None          # the grid node we're APPROACHING/PARKING toward
         last_accepted_marker_time = None   # for the drifted/blind guard below
         path_len_at_last_marker = 0.0      # pose_est.path_length when we last got a fix
         arrived_node = None          # the grid node we finished a mission at (see DONE)
 
         # ADVANCING_TO_TURN: a turn decision was made, the robot keeps driving straight
-        # for advance_time (per-robot), then the turn actually starts (see the note above).
+        # for ADVANCE_TIME, then the turn actually starts (see the note above).
         pre_turn_next_state = None   # "TURNING_LEFT" | "TURNING_RIGHT"
         pre_turn_start = None
-        advance_time_this_turn = advance_time   # per-turn (advance_time_boundary at grid edges)
+        advance_time_this_turn = ADVANCE_TIME   # per-turn (shorter at grid boundaries)
 
         turn_start = None
         turn_last_time = None
@@ -808,8 +774,8 @@ class ArtProject:
                 # Symmetric (ignores priority) - just don't hit each other. Only
                 # while driving forward in a corridor; the short in-place TURNING
                 # states are left alone so the psi PI controller isn't disturbed.
-                if self.state in ("FOLLOWING", "METRONOME", "ADVANCING_TO_TURN",
-                                  "ADVANCING_FROM_TURN") \
+                if self.state in ("FOLLOWING", "APPROACHING", "ADVANCING_TO_TURN",
+                                  "ADVANCING_FROM_TURN", "PARKING") \
                         and self._robot_emergency_ahead():
                     frodo.control.setTrackSpeed(0.0, 0.0)
                     cv2.putText(display_frame, "ROBOT AHEAD - HOLDING", (30, 150),
@@ -861,22 +827,23 @@ class ArtProject:
                     cv2.putText(display_frame, f"{detected_id} ({aruco_size}px)", (x, max(y - 10, 20)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
-                    # --- filter decision --- (window is per-robot: aruco_y_min / _x_min / _x_max)
-                    if center_y < aruco_y_min * h_img or aruco_size < aruco_min_size_px:
+                    # While closing on the target, keep the latest size of ITS marker
+                    # (arrival is judged by this, not the EKF).
+                    if self.state == "APPROACHING" and detected_id == approach_target_id:
+                        approach_target_size = aruco_size
+
+                    # --- filter decision ---
+                    if center_y < ARUCO_Y_MIN * h_img or aruco_size < aruco_min_size_px:
                         status = "TOO FAR"
-                    elif center_x < aruco_x_min * w_img or center_x > aruco_x_max * w_img:
+                    elif center_x < ARUCO_X_MIN * w_img or center_x > ARUCO_X_MAX * w_img:
                         status = "WRONG LANE"
                     elif detected_id not in CITY_MAP:
                         status = "NOT ON MAP"
                     elif detected_id == LAST_SEEN_ID:
                         status = "already processed"
+                    elif self.state != "FOLLOWING":
+                        status = f"state={self.state}"
                     else:
-                        # ACCEPTED regardless of FSM state - POSITION TRACKING below
-                        # must run for a marker the robot physically drives over even
-                        # while ADVANCING_FROM_TURN / TURNING (it used to be dropped
-                        # with "state=..." and the robot never recorded that node ->
-                        # missed markers right after a turn). The turn/target DECISION
-                        # is still gated on FOLLOWING further down.
                         status = "ACCEPTED"
 
                     if log_aruco:
@@ -943,25 +910,36 @@ class ArtProject:
                                         ROBOT_HEADING = "NORTH" if dyr > 0 else "SOUTH"
                                     CURRENT_TARGET_COLOR = "pink" if ROBOT_HEADING in ("EAST", "WEST") else "green"
                                     heading_known = True
+                                    prev_node_for_heading = current_coord
+                                    turned_since_prev_node = False
                                     print(f"Heading calibrated from real movement {first_fix_coord} -> "
                                           f"{current_coord}: {ROBOT_HEADING} (color={CURRENT_TARGET_COLOR})")
-                        # NOTE: no continuous node-to-node heading re-sync - heading is
-                        # only ever changed here (calibration) and at an explicit turn.
-
-                        # If the turn-exit drive reached the NEXT grid node before it
-                        # finished centering, we're clearly back on the new line - snap
-                        # to FOLLOWING now so the decision for THIS node runs this frame
-                        # (otherwise a turn needed right after another turn is missed).
-                        if self.state == "ADVANCING_FROM_TURN":
-                            print(f"  [turn exit] reached node {current_coord} -> FOLLOWING")
-                            self.state = "FOLLOWING"
-                            turn_exit_start = None
-                            turn_exit_centered_since = None
-                            turn_exit_sweep_start = None
+                        else:
+                            # ---------------- CONTINUOUS HEADING RE-SYNC ----------------
+                            # Heading already known. If we reached this node on a
+                            # STRAIGHT run (no turn since the previous node fix), the
+                            # node-to-node delta is the real heading - snap to it if it
+                            # disagrees with the dead-reckoned ROBOT_HEADING.
+                            if prev_node_for_heading is not None and not turned_since_prev_node:
+                                hdx = current_coord[0] - prev_node_for_heading[0]
+                                hdy = current_coord[1] - prev_node_for_heading[1]
+                                if hdx != 0 or hdy != 0:
+                                    if abs(hdx) >= abs(hdy):
+                                        observed = "EAST" if hdx > 0 else "WEST"
+                                    else:
+                                        observed = "NORTH" if hdy > 0 else "SOUTH"
+                                    if observed != ROBOT_HEADING:
+                                        print(f"  [heading re-sync] {prev_node_for_heading} -> "
+                                              f"{current_coord} = {observed}, was {ROBOT_HEADING} - correcting")
+                                        ROBOT_HEADING = observed
+                                        CURRENT_TARGET_COLOR = ("pink" if observed in ("EAST", "WEST")
+                                                                else "green")
+                            prev_node_for_heading = current_coord
+                            turned_since_prev_node = False
 
                     # ---------------- DECISION MAKING ----------------
                     # Only ACT on a decision while actually FOLLOWING (position/heading
-                    # tracking above already ran regardless of state).
+                    # tracking above already ran).
                     if self.state != "FOLLOWING":
                         break
 
@@ -973,20 +951,20 @@ class ArtProject:
                         break
 
                     if current_coord == target_node:
-                        # Target marker ACCEPTED (already close - the accept filter
-                        # requires a real pixel size / lane / y-min). Open the servo
-                        # NOW (metronome starts), keep line-following slowly forward
-                        # for SERVO_OPEN_DRIVE_TIME, then close it + stop + DONE.
                         arriving_node = target_node
-                        print(f"*** TARGET {target_node} marker {detected_id} ACCEPTED ({aruco_size}px) "
-                              f"- opening servo, running the metronome for {SERVO_OPEN_DRIVE_TIME:.1f}s ***")
-                        frodo.control.setTrackSpeed(0.0, 0.0)
-                        if SERVO_ON_ARRIVAL:
-                            self.servo_trigger.rotate_to_trigger()   # blocks ~settle_time, robot stopped
-                            self.frodo.communication.send_event('art_project_servo_triggered',
-                                                                {'node': list(target_node)})
-                        metronome_close_time = time.time() + SERVO_OPEN_DRIVE_TIME
-                        self.state = "METRONOME"
+                        approach_target_id = detected_id
+                        approach_target_size = aruco_size
+                        approach_line_lost_since = None
+                        if aruco_size >= ARRIVE_MARKER_SIZE_PX:
+                            # already on the marker - short settle, then park/servo
+                            print(f"*** TARGET {target_node} - marker {aruco_size}px, on it -> parking ***")
+                            frodo.control.setTrackSpeed(0.0, 0.0)
+                            self.state = "PARKING"
+                            stop_timer = now + PARK_TIME_ON_MARKER
+                        else:
+                            print(f"*** TARGET {target_node} SEEN ({aruco_size}px) - closing in ***")
+                            approach_start = now
+                            self.state = "APPROACHING"
                         break
 
                     if not heading_known:
@@ -994,33 +972,51 @@ class ArtProject:
                         # can't safely decide CONTINUE vs TURN. Wait for the second fix.
                         break
 
-                    # ---------------- NEXT STEP (fewest-turns shortest path) ----------------
-                    # BFS with prefer=ROBOT_HEADING => drive straight along one axis
-                    # until in line with the target, then turn ONCE onto the other
-                    # axis (grid_nav.next_heading). No cooperative A* / peer planning
-                    # any more - the path is deterministic. The only reroute is the
-                    # reactive camera one: if a HIGHER-priority robot's body marker is
-                    # sitting in the cell straight ahead, drop that cell so BFS finds
-                    # a detour (the symmetric EMERGENCY stop still guards contact).
+                    # ---------------- NEXT STEP (shortest path, route around a blocking robot) ----------------
+                    # BFS over the grid gives a minimum-length path; if a
+                    # higher-priority robot is sitting in the cell I'd drive into
+                    # by going straight, drop that cell so BFS finds a detour.
                     blocked_cells = set()
+                    reactive_ahead_cell = None
                     if self._forward_cell_blocked():
                         step = DIRECTIONS.get(ROBOT_HEADING, (0, 0))
-                        ahead_cell = (current_coord[0] + step[0], current_coord[1] + step[1])
-                        blocked_cells.add(ahead_cell)
-                        print(f"  [avoidance] higher-priority robot ahead - routing around {ahead_cell}")
+                        reactive_ahead_cell = (current_coord[0] + step[0], current_coord[1] + step[1])
+                        blocked_cells.add(reactive_ahead_cell)
+                        print(f"  [avoidance] higher-priority robot ahead - routing around {reactive_ahead_cell}")
 
-                    desired_heading = next_heading(current_coord, target_node, GRID_NODES,
-                                                   blocked=blocked_cells, prefer=ROBOT_HEADING)
-                    if desired_heading is None and blocked_cells:
-                        # No detour exists (rare on an open grid). Fall back to the
-                        # unblocked shortest path - the EMERGENCY stop still keeps
-                        # the robots from actually touching.
-                        print("  [avoidance] no detour - holding to shortest path, emergency-stop will guard")
+                    # Approach B: Cooperative A* over what every robot last broadcast
+                    # (peer_sync.py) - plans a full conflict-free route instead of only
+                    # reacting to whoever the camera sees right now. The camera check
+                    # above still wins if the two disagree (ground truth beats a
+                    # <=0.5s-old broadcast) - see the `!= reactive_ahead_cell` guard.
+                    coop_step = self._cooperative_next_step(current_coord, target_node)
+                    coop_cell = None
+                    if coop_step and coop_step != "WAIT":
+                        dx, dy = DIRECTIONS[coop_step]
+                        coop_cell = (current_coord[0] + dx, current_coord[1] + dy)
+
+                    if coop_cell is not None and coop_cell != reactive_ahead_cell:
+                        desired_heading = coop_step
+                        print(f"  [cooperative] plan says {desired_heading}")
+                    else:
+                        if coop_step == "WAIT":
+                            step = DIRECTIONS.get(ROBOT_HEADING, (0, 0))
+                            wait_cell = (current_coord[0] + step[0], current_coord[1] + step[1])
+                            blocked_cells.add(wait_cell)
+                            print(f"  [cooperative] yielding at {current_coord} - routing around {wait_cell}")
+
                         desired_heading = next_heading(current_coord, target_node, GRID_NODES,
-                                                       prefer=ROBOT_HEADING)
-                    if desired_heading is None:
-                        print(f"!!! No path from {current_coord} to {target_node} - staying put")
-                        break
+                                                       blocked=blocked_cells, prefer=ROBOT_HEADING)
+                        if desired_heading is None and blocked_cells:
+                            # No detour exists (rare on an open grid). Fall back to the
+                            # unblocked shortest path - the EMERGENCY stop still keeps
+                            # the robots from actually touching.
+                            print("  [avoidance] no detour - holding to shortest path, emergency-stop will guard")
+                            desired_heading = next_heading(current_coord, target_node, GRID_NODES,
+                                                           prefer=ROBOT_HEADING)
+                        if desired_heading is None:
+                            print(f"!!! No path from {current_coord} to {target_node} - staying put")
+                            break
 
                     print(f"Heading: {ROBOT_HEADING} -> Desired: {desired_heading}")
 
@@ -1098,13 +1094,13 @@ class ArtProject:
                         if pre_turn_next_state is not None:
                             # Pre-turn open-loop advance to the intersection centre.
                             # At a BOUNDARY node the cell straight ahead doesn't
-                            # exist - a full advance_time there drives the robot off
+                            # exist - a full ADVANCE_TIME there drives the robot off
                             # the end of the grid, so the pivot happens away from the
                             # new line and it never re-acquires it (seen in the field
-                            # at (8,0)). Use advance_time_boundary in that case.
+                            # at (8,0)). Use a short advance in that case.
                             _odx, _ody = DIRECTIONS.get(ROBOT_HEADING, (0, 0))
                             _ahead = (current_coord[0] + _odx, current_coord[1] + _ody)
-                            advance_time_this_turn = advance_time if _ahead in GRID_NODES else advance_time_boundary
+                            advance_time_this_turn = ADVANCE_TIME if _ahead in GRID_NODES else ADVANCE_TIME_BOUNDARY
                             # NOTE: CURRENT_TARGET_COLOR is NOT changed here - the robot
                             # is still coming from the old position during
                             # ADVANCING_TO_TURN, the color only switches once the turn
@@ -1118,6 +1114,7 @@ class ArtProject:
                             # instead of repeatedly flagging the unsupported 180 turn.
                             ROBOT_HEADING = desired_heading
                             pre_turn_start = now
+                            turned_since_prev_node = True   # skip re-sync at the next node (this turn is intentional)
                             last_accepted_marker_time = now  # restart the "lost" clock for the post-turn leg
                             path_len_at_last_marker = self.pose_est.path_length
                             self.state = "ADVANCING_TO_TURN"
@@ -1126,16 +1123,16 @@ class ArtProject:
 
                 # ---------------- DRIFTED / OVERSHOT GUARD ----------------
                 # Navigating with a target, heading known, but no accepted marker
-                # after driving marker_lost_dist_m since the last one (or stuck and
+                # after driving MARKER_LOST_DIST_M since the last one (or stuck and
                 # blind for MARKER_TIMEOUT_S) -> we've left the grid / overshot with
                 # nothing to stop us, OR the camera simply can't read the markers.
-                if (self.state == "FOLLOWING" and heading_known
+                if (self.state in ("FOLLOWING", "APPROACHING") and heading_known
                         and last_accepted_marker_time is not None):
                     with self._lock:
                         _tgt = self.target_node
                     _dist_since = self.pose_est.path_length - path_len_at_last_marker
                     _blind_time = now - last_accepted_marker_time
-                    if _tgt is not None and (_dist_since > marker_lost_dist_m
+                    if _tgt is not None and (_dist_since > MARKER_LOST_DIST_M
                                              or _blind_time > MARKER_TIMEOUT_S):
                         print(f"!!! No marker for {_dist_since:.2f} m / {_blind_time:.1f}s while navigating "
                               f"to {_tgt} - lost, or the camera can't read the markers.")
@@ -1151,18 +1148,12 @@ class ArtProject:
                         self.state = "STOPPED"
 
                 # ================= LINE FOLLOWING =================
-                # CURRENT_TARGET_COLOR is a PURE FUNCTION of ROBOT_HEADING now
-                # (E/W = pink X-axis, N/S = green Y-axis). It is set at calibration
-                # and at every turn - never switched here. The old "current colour
-                # lost but a clear other-colour line is here -> switch" recovery is
-                # GONE: at every grid intersection the crossing line legitimately
-                # has a big contour, so it fired constantly on the green legs,
-                # flipped the robot onto pink, and sent it staircasing off the grid.
-                if self.state in ("FOLLOWING", "METRONOME"):
-                    if LAST_SEEN_ID is None and self.state == "FOLLOWING" and not heading_known:
-                        # No marker read yet -> we don't know which colour line we're
-                        # on. Follow whichever is visible until the first fix; heading
-                        # calibration then locks the colour to the real axis.
+                if self.state in ("FOLLOWING", "APPROACHING"):
+                    if LAST_SEEN_ID is None and self.state == "FOLLOWING":
+                        # No marker read yet -> we don't know which color line we're
+                        # on (the default "pink" is just a placeholder). Try both
+                        # colors and follow whichever is visible, so we can still
+                        # reach a marker even if we start on the green path.
                         best_color, best_found = None, None
                         for probe_color in ("pink", "green"):
                             found = find_line(get_color_mask(frame, probe_color))
@@ -1174,40 +1165,56 @@ class ArtProject:
                     mask = get_color_mask(frame, CURRENT_TARGET_COLOR)          # RAW frame!
                     error, line_detected, _area = calculate_deviation(mask, display_frame)
 
-                    # METRONOME: servo is OPEN, keep line-following slowly forward so
-                    # the metronome runs while moving (SERVO_OPEN_DRIVE_TIME), then
-                    # close the servo + stop + DONE.
-                    follow_speed = (base_speed * 0.5) if self.state == "METRONOME" else base_speed
+                    # 2026-09-07 field observation: heading calibration needs a SECOND
+                    # real node fix (see HEADING CALIBRATION above) to correct the
+                    # initial pink/green guess - if that second fix never comes (line
+                    # lost before reaching the next marker), CURRENT_TARGET_COLOR stays
+                    # wrong forever and the robot wanders off on stray same-color noise
+                    # until it runs out of anything to follow (observed: frodo1 "went
+                    # diagonal", LINE LOST far from where it should have stopped).
+                    # Recovery: once heading isn't known yet AND the current color just
+                    # failed, try the OTHER color before giving up - this only fires on
+                    # an actual failure (not every frame), so it can't reintroduce the
+                    # per-frame flip-flop the LAST_SEEN_ID gating above was written to
+                    # avoid.
+                    # Current colour lost - try the OTHER colour. When heading isn't
+                    # known yet any visible line will do (initial guess). When it IS
+                    # known, only switch if the other colour shows a CLEAR line (area
+                    # well over the noise floor) - that means the robot is physically
+                    # on the perpendicular lane, i.e. ROBOT_HEADING / colour desynced
+                    # (seen after an imperfect turn: sitting on the pink E-W line but
+                    # looking for green). Switch and force a heading re-sync at the
+                    # next node. The "clear line" bar keeps this from flip-flopping.
+                    if not line_detected:
+                        other_color = "green" if CURRENT_TARGET_COLOR == "pink" else "pink"
+                        other_found = find_line(get_color_mask(frame, other_color))
+                        _clear = other_found is not None and (not heading_known or other_found[1] > 3000)
+                        if _clear:
+                            if heading_known:
+                                print(f"  [colour] {CURRENT_TARGET_COLOR} lost but a clear {other_color} "
+                                      f"line is here - heading/colour desynced, switching + will re-sync")
+                                turned_since_prev_node = False   # let the next node fix ROBOT_HEADING
+                            else:
+                                print(f"  [colour] {CURRENT_TARGET_COLOR} lost, heading not yet known "
+                                      f"- switching to {other_color}")
+                            CURRENT_TARGET_COLOR = other_color
+                            mask = get_color_mask(frame, CURRENT_TARGET_COLOR)
+                            error, line_detected, _area = calculate_deviation(mask, display_frame)
 
                     if line_detected:
                         line_lost_since = None
                         line_lost_reported = False
-                        # D term: rate of change of the pixel error. Reset (prev=None)
-                        # whenever the line was not seen, so re-acquiring it after a
-                        # gap doesn't produce a huge spurious derivative.
-                        d_err = 0.0
-                        if prev_line_error is not None and (now - prev_line_error_t) > 1e-3:
-                            d_err = (error - prev_line_error) / (now - prev_line_error_t)
-                        prev_line_error, prev_line_error_t = error, now
-                        forward_speed, angular_speed = proportional_controller(
-                            error, kp, follow_speed, d_error=d_err, kd=kd)
+                        forward_speed, angular_speed = proportional_controller(error, kp, base_speed)
                         v_left, v_right = calculate_wheel_speeds(forward_speed, angular_speed, track_width)
                         frodo.control.setTrackSpeed(v_left, v_right)
-                    elif self.state == "METRONOME":
-                        # line lost right on top of the target marker is normal - just
-                        # creep straight, the close timer ends it in a moment anyway
-                        prev_line_error = None
-                        frodo.control.setTrackSpeed(follow_speed, follow_speed)
                     elif self.state == "FOLLOWING" and \
                             (now - (line_lost_since or now)) < LINE_LOST_CREEP_TIME:
                         if line_lost_since is None:
                             line_lost_since = now
-                        prev_line_error = None
                         frodo.control.setTrackSpeed(base_speed, base_speed)
                         cv2.putText(display_frame, "LINE LOST - CREEPING", (10, 120),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
                     else:
-                        prev_line_error = None
                         frodo.control.setTrackSpeed(0.0, 0.0)
                         # FOLLOWING, past the creep window, line still not found: no automatic
                         # recovery beyond this point (needs a human nudge or the line reappearing
@@ -1228,36 +1235,38 @@ class ArtProject:
                                 },
                             })
 
-                    # ---------------- METRONOME: close the servo, then MISSION COMPLETE ----------------
-                    if self.state == "METRONOME":
-                        cv2.putText(display_frame, "METRONOME (servo open)", (10, 190),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
-                        if time.time() >= metronome_close_time:
+                    if self.state == "APPROACHING":
+                        approach_elapsed = now - approach_start
+                        cv2.putText(display_frame, f"APPROACHING {approach_target_size}px",
+                                    (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
+                        if (now - last_approach_log) > 0.3:
+                            last_approach_log = now
+                            print(f"  [APPROACH {approach_elapsed:.2f}s] target marker {approach_target_id} "
+                                  f"size={approach_target_size}px (arrive at {ARRIVE_MARKER_SIZE_PX})")
+
+                        if line_detected:
+                            approach_line_lost_since = None
+                            stalled = False
+                        else:
+                            if approach_line_lost_since is None:
+                                approach_line_lost_since = now
+                            stalled = (now - approach_line_lost_since) > APPROACH_STALL_GRACE
+
+                        on_marker = approach_target_size >= ARRIVE_MARKER_SIZE_PX
+                        timed_out = approach_elapsed > APPROACH_TIMEOUT
+                        if timed_out and not on_marker:
+                            print(f"!!! APPROACH TIMEOUT ({APPROACH_TIMEOUT}s) - marker only got to "
+                                  f"{approach_target_size}px, parking anyway")
+                        elif stalled and not on_marker:
+                            print(f"Line lost, robot stopped (marker {approach_target_size}px) - parking now")
+
+                        if on_marker or timed_out or stalled:
+                            _pt = PARK_TIME_ON_MARKER if on_marker else PARKING_TIME
+                            print(f"*** MARKER REACHED ({approach_target_size}px). Parking {_pt}s ***")
                             frodo.control.setTrackSpeed(0.0, 0.0)
-                            if SERVO_ON_ARRIVAL:
-                                self.servo_trigger.rotate_to_home()   # close the servo
-                            arrived_node = arriving_node
-                            arriving_node = None
-                            with self._lock:
-                                if self.target_node == arrived_node:
-                                    self.target_node = None
-                            self.state = "DONE"
-                            print(f"\n*** MISSION COMPLETE - arrived at {arrived_node}, metronome done. "
-                                  f"Holding until a new go_to_position(). ***")
-                            ap_x, ap_y, ap_psi = self.pose_est.get()
-                            ap_target = None
-                            if arrived_node is not None:
-                                _ax, _ay = grid_node_to_world(arrived_node)
-                                ap_target = {'x': _ax, 'y': _ay, 'psi': None, 'speed': None, 'tolerance': None}
-                            self.frodo.communication.send_event('art_project', {
-                                'type': 'position_reached',
-                                'data': {
-                                    'pose': {'x': float(ap_x), 'y': float(ap_y), 'psi': float(ap_psi),
-                                             'time': time.time()},
-                                    'target': ap_target,
-                                    'node': list(arrived_node) if arrived_node is not None else None,
-                                },
-                            })
+                            self.state = "PARKING"
+                            stop_timer = now + _pt
+                            approach_line_lost_since = None
 
                 # ================= SHORT STRAIGHT ADVANCE TO INTERSECTION =================
                 # We do NOT look at the image at all - just drive forward at a fixed
@@ -1341,10 +1350,50 @@ class ArtProject:
                         turn_exit_centered_since = None
                         turn_exit_sweep_start = None
 
-                # (Arrival is handled entirely by the METRONOME branch inside LINE
-                # FOLLOWING above: open servo -> drive slowly for SERVO_OPEN_DRIVE_TIME
-                # -> close servo -> DONE. There is no separate APPROACHING/PARKING
-                # state any more.)
+                # ================= SHORT STRAIGHT ADVANCE AT THE TARGET =================
+                # Same idea as ADVANCING_TO_TURN: drive forward at a fixed speed
+                # without looking at the image for PARKING_TIME, then stop - so we end
+                # up at the exact center of the marker (not by line following, since
+                # the line is usually lost right on top of the marker anyway).
+                elif self.state == "PARKING":
+                    frodo.control.setTrackSpeed(base_speed, base_speed)
+                    cv2.putText(display_frame, "PARKING...", (60, 150),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 165, 255), 3)
+                    if time.time() > stop_timer:
+                        frodo.control.setTrackSpeed(0.0, 0.0)
+                        arrived_node = arriving_node
+                        arriving_node = None
+
+                        if SERVO_ON_ARRIVAL:
+                            # The metronome device sits on this node - cycle the servo
+                            # in place (robot is stopped, covers no distance), then hold.
+                            print(f"\n*** ARRIVED at target {arrived_node} - triggering servo ***")
+                            self.servo_trigger.rotate_to_trigger()
+                            self.servo_trigger.rotate_to_home()
+                            self.frodo.communication.send_event('art_project_servo_triggered',
+                                                                {'node': list(arrived_node) if arrived_node else None})
+
+                        with self._lock:
+                            if self.target_node == arrived_node:
+                                self.target_node = None
+                        self.state = "DONE" if SERVO_ON_ARRIVAL else "FOLLOWING"
+                        print("*** MISSION COMPLETE - holding until a new go_to_position(). ***"
+                              if SERVO_ON_ARRIVAL else
+                              "\n*** ARRIVED. Resuming line following, waiting for next go_to_position(). ***")
+                        arrived_pose_x, arrived_pose_y, arrived_pose_psi = self.pose_est.get()
+                        arrived_target = None
+                        if arrived_node is not None:
+                            ax, ay = grid_node_to_world(arrived_node)
+                            arrived_target = {'x': ax, 'y': ay, 'psi': None, 'speed': None, 'tolerance': None}
+                        self.frodo.communication.send_event('art_project', {
+                            'type': 'position_reached',
+                            'data': {
+                                'pose': {'x': float(arrived_pose_x), 'y': float(arrived_pose_y),
+                                         'psi': float(arrived_pose_psi), 'time': time.time()},
+                                'target': arrived_target,
+                                'node': list(arrived_node) if arrived_node is not None else None,  # FRODO-specific extra
+                            },
+                        })
 
                 # ================= TURNING (closed loop, EKF psi + PI) =================
                 elif self.state in ("TURNING_LEFT", "TURNING_RIGHT"):

@@ -142,6 +142,69 @@ def astar(start, goal, nodes, cost_fn=None, heuristic=None, blocked=None):
     return None
 
 
+# === SINGLE-AGENT: TURN-AWARE A* (what grid_nav.next_heading drives on) ===============
+_STEP_TO_DIR = {step: name for name, step in DIRECTIONS.items()}
+
+
+def astar_next_step(start, goal, nodes, blocked=None, prefer=None, turn_penalty=0.001):
+    """A* (Manhattan heuristic) start -> goal on the 4-connected grid, with the
+    search STATE augmented to (node, incoming_step) so a tiny `turn_penalty` per
+    direction change is charged. That makes the fewest-turns shortest path win
+    (drive straight along one axis, then ONE turn onto the other) instead of a
+    staircase - `turn_penalty` is small enough (0.001) that a longer path is
+    never preferred just to save a turn. `prefer` (a cardinal name, the robot's
+    current heading) seeds the incoming step so continuing straight is free.
+    `blocked`: nodes that may not be entered (start always allowed).
+
+    Returns the full node list [start, ..., goal], or None if unreachable.
+    This is what grid_nav.next_heading() calls - it then returns the first hop.
+    """
+    blocked = set(blocked or ())
+    blocked.discard(start)
+    if start == goal:
+        return [start]
+
+    prefer_step = DIRECTIONS.get(prefer) if prefer else None
+    start_state = (start, prefer_step)
+    g_score = {start_state: 0.0}
+    came_from = {start_state: None}
+    counter = itertools.count()
+    heap = [(manhattan(start, goal), next(counter), start_state)]
+    closed = set()
+
+    while heap:
+        _, _, state = heapq.heappop(heap)
+        if state in closed:
+            continue
+        node, in_step = state
+        if node == goal:
+            path = [node]
+            s = state
+            while came_from[s] is not None:
+                s = came_from[s]
+                path.append(s[0])
+            path.reverse()
+            return path
+        closed.add(state)
+
+        for step_name, (dx, dy) in DIRECTIONS.items():
+            nxt = (node[0] + dx, node[1] + dy)
+            if nxt not in nodes or nxt in blocked:
+                continue
+            move = (dx, dy)
+            turn = turn_penalty if (in_step is not None and in_step != move) else 0.0
+            nxt_state = (nxt, move)
+            if nxt_state in closed:
+                continue
+            tentative_g = g_score[state] + 1.0 + turn
+            if nxt_state not in g_score or tentative_g < g_score[nxt_state]:
+                g_score[nxt_state] = tentative_g
+                came_from[nxt_state] = state
+                heapq.heappush(heap, (tentative_g + manhattan(nxt, goal), next(counter), nxt_state))
+
+    return None
+
+
 # === MULTI-AGENT: COOPERATIVE A* (space-time, prioritized) ===========================
 def _space_time_astar(start, goal, nodes, reserved_cells, reserved_edges, max_time, heuristic):
     """A* over states (node, t). Actions: move to a 4-connected neighbor, or
