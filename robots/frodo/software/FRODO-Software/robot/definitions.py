@@ -500,6 +500,13 @@ def get_all_aruco_ids() -> List[int]:
     for static_id, static_def in STATIC_DEFINITIONS.items():
         ids.extend(range(static_def.aruco_front, static_def.aruco_back + 1))
 
+    # art_project robot BODY markers (ROBOT_BODY_MARKERS in
+    # applications/art_project/art_project_frodo.py): frodo1 wears 995 (front) /
+    # 996 (back), frodo4 wears 997 / 998. art_project's reactive collision
+    # avoidance reads frodo.sensors' aruco_measurements, so these IDs must
+    # survive the detector allowlist or _nearest_robot_ahead() sees nothing.
+    ids.extend([995, 996, 997, 998])
+
     # Deduplicate and sort for stability
     return sorted(set(ids))
 
