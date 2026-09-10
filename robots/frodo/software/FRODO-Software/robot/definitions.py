@@ -286,7 +286,7 @@ FRODO_MODEL_GENERAL = FRODO_Physical_Model(
 
 FRODO_CAMERA_SETTINGS_FRODO1 = FRODO_Camera_Settings(
     camera=PyCameraType.GS,
-    fov=np.deg2rad(120),
+    fov=np.deg2rad(60),  # same physical lens as frodo4 (was wrongly set to 120)
     resolution=(728, 544),
     camera_to_center_distance=0.0647,
     autofocus=False,
