@@ -33,8 +33,12 @@ def get_color_mask(frame, target_color):
         # fine, but every turn onto a GREEN (N-S) line failed to find it and it
         # got lost. Under blur / this lighting the green stripe's pixels sit
         # around S~60-90 / V~80-120 and were being rejected. Loosen to pink-like.
-        lower_bound = np.array([38, 45, 45])
-        upper_bound = np.array([90, 255, 255])
+        # 2026-09-10 color_probe.py under direct sun on both robots: sun-washed
+        # green medians H~44-51 / S~38 / V~158-211, envelope H 29-78 / S 30-76.
+        # S floor 45 was still throwing out half the green pixels -> drop it to
+        # 22, H floor 38 -> 28, with headroom for shaded stretches too.
+        lower_bound = np.array([28, 22, 40])
+        upper_bound = np.array([95, 255, 255])
     elif target_color == "blue":
         lower_bound = np.array([100, 100, 100])
         upper_bound = np.array([130, 255, 255])
