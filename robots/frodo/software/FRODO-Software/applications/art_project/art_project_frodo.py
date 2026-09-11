@@ -135,7 +135,7 @@ ROBOT_TUNING = {
         # aruco_y_min ~0.45 / aruco_x_min-max 0.30-0.70 back here.
         "aruco_min_size_px": 140,
         "turn_kp": 2.0,
-        "turn_angle_deg": 104.0,
+        "turn_angle_deg": 108.0,
         "advance_time": 1.6,
         "advance_time_boundary": 0.4,
         "marker_lost_dist_m": 1.3,
@@ -149,7 +149,7 @@ ROBOT_TUNING = {
     "frodo4": {
         "aruco_min_size_px": 140,
         "turn_kp": 1.8,
-        "turn_angle_deg": 130.0,    # 96 under-rotated - frodo4 ended the pivot short of the new
+        "turn_angle_deg": 13.0,    # 96 under-rotated - frodo4 ended the pivot short of the new
                                     # line and lost it. Raise until it lands ON the line (watch the
         "advance_time": 1.6,
         "advance_time_boundary": 0.4,
@@ -286,8 +286,8 @@ ROBOT_PRIORITY = ["frodo1", "frodo2", "frodo3", "frodo4"]
 # (col, row); CITY_MAP id = row * GRID_COLS + col.  Edit freely per test.
 # 2026-09-08: metronome at marker id 9 = (0,1) for frodo1, id 28 = (1,3) for frodo4.
 TEST_TARGET_BY_ROBOT = {
-    "frodo1": (5, 2),   # CITY_MAP id
-    "frodo4": (7, 2),   # CITY_MAP id 38
+    "frodo1": (3, 3),   # CITY_MAP id
+    "frodo4": (4, 1),   # CITY_MAP id 38
 }
 
 # Another robot seen closer than *_BLOCK_DISTANCE_M and within +-*_AHEAD_BEARING
@@ -296,6 +296,31 @@ TEST_TARGET_BY_ROBOT = {
 OTHER_ROBOT_BLOCK_DISTANCE_M = 0.55
 OTHER_ROBOT_EMERGENCY_DISTANCE_M = 0.28
 OTHER_ROBOT_AHEAD_BEARING = np.radians(45)
+
+# A body marker can drop out of view for reasons that have nothing to do with
+# the other robot actually clearing out of the way - most notably it pivoting
+# in place (TURNING_LEFT/RIGHT), which turns its front/back marker face away
+# from our camera while it's still sitting on the same spot (body markers only
+# cover the front+back faces - see ROBOT_BODY_MARKERS). frodo_sensors.py
+# replaces aruco_measurements wholesale every detection cycle with no
+# persistence, so a marker gone from this frame's list looks identical to
+# "the robot left" - it isn't. Keep the last real sighting "live" for this
+# long before treating the path as actually clear (observed in the field:
+# frodo4 lost frodo1's marker the instant frodo1 started turning and drove
+# into it). 3s ~= one grid-turn's worth of time (TURN_TIMEOUT=10s is the
+# worst case, but a normal turn completes well within this).
+OTHER_ROBOT_LAST_SEEN_GRACE_S = 3.0
+
+# The distance-triggered emergency stop above (OTHER_ROBOT_EMERGENCY_DISTANCE_M)
+# still fires too late in the field: by the time the other robot is MEASURED
+# within that distance, camera/processing lag plus the robot's own momentum has
+# already carried it into contact (observed: frodo4 kept driving for a bit after
+# first reading frodo1's marker and hit it). So, separately, cap how long we're
+# allowed to keep driving after FIRST seeing the other robot's marker at all
+# (any distance, still gated to the forward bearing cone) - then force a stop
+# and hold it, regardless of what the marker does meanwhile.
+OTHER_ROBOT_SIGHT_STOP_DELAY_S = 1.0   # keep driving at most this long after first sighting
+OTHER_ROBOT_SIGHT_HOLD_S = 4.0         # then hold stopped this long before re-evaluating
 
 
 # =====================================================================================
@@ -397,6 +422,13 @@ class ArtProject:
         for other_id, markers in ROBOT_BODY_MARKERS.items():
             if other_id != my_id:
                 self.other_robot_markers |= markers
+        # latch_key -> (last_seen_time, dist_m, bearing_rad) - see
+        # OTHER_ROBOT_LAST_SEEN_GRACE_S / _nearest_robot_ahead()
+        self._last_robot_seen = {}
+        # time-based sighting hold - see _sighting_hold_active() /
+        # OTHER_ROBOT_SIGHT_STOP_DELAY_S / OTHER_ROBOT_SIGHT_HOLD_S
+        self._other_seen_since = None
+        self._sight_hold_until = None
         frodo.logger.info(
             f"Collision avoidance: id={my_id!r} priority={self.my_priority} "
             f"route-around={sorted(self.higher_priority_markers)}")
@@ -531,40 +563,85 @@ class ArtProject:
             return None
 
     # === MULTI-ROBOT SENSING ==========================================================================================
-    def _nearest_robot_ahead(self, marker_ids):
-        """(distance_m, bearing_rad) of the closest body marker in `marker_ids`
-        currently reported by frodo.sensors, or None. bearing: + = left,
-        - = right, 0 = straight ahead. Only markers in front (fwd > 0) count."""
+    def _nearest_robot_ahead(self, marker_ids, latch_key):
+        """(distance_m, bearing_rad) of the closest body marker in `marker_ids`,
+        or None. bearing: + = left, - = right, 0 = straight ahead. Only markers
+        in front (fwd > 0) count.
+
+        Latched (see OTHER_ROBOT_LAST_SEEN_GRACE_S): if no marker is seen THIS
+        frame, the last real sighting under `latch_key` is still returned for a
+        grace period instead of immediately reporting "nothing there" - a
+        vanished marker usually means the other robot turned its marker face
+        away (e.g. pivoting in place), not that it actually left."""
         if not marker_ids:
             return None
+        best = None
         try:
             sample = self.frodo.sensors.getSample()
         except Exception:
-            return None
-        best = None
-        for m in sample.aruco_measurements:
-            if m.measured_aruco_id not in marker_ids:
-                continue
-            fwd, left = float(m.position[0]), float(m.position[1])
-            if fwd <= 0.0:
-                continue
-            dist = float(np.hypot(fwd, left))
-            if best is None or dist < best[0]:
-                best = (dist, float(np.arctan2(left, fwd)))
-        return best
+            sample = None
+        if sample is not None:
+            for m in sample.aruco_measurements:
+                if m.measured_aruco_id not in marker_ids:
+                    continue
+                fwd, left = float(m.position[0]), float(m.position[1])
+                if fwd <= 0.0:
+                    continue
+                dist = float(np.hypot(fwd, left))
+                if best is None or dist < best[0]:
+                    best = (dist, float(np.arctan2(left, fwd)))
+
+        now = time.time()
+        if best is not None:
+            self._last_robot_seen[latch_key] = (now, best[0], best[1])
+            return best
+        seen = self._last_robot_seen.get(latch_key)
+        if seen is not None and (now - seen[0]) <= OTHER_ROBOT_LAST_SEEN_GRACE_S:
+            return (seen[1], seen[2])
+        return None
 
     def _robot_emergency_ahead(self) -> bool:
         """Another robot (any priority) close and straight ahead -> hard stop."""
-        hit = self._nearest_robot_ahead(self.other_robot_markers)
+        hit = self._nearest_robot_ahead(self.other_robot_markers, "emergency")
         return (hit is not None
                 and hit[0] <= OTHER_ROBOT_EMERGENCY_DISTANCE_M
                 and abs(hit[1]) <= OTHER_ROBOT_AHEAD_BEARING)
+
+    def _sighting_hold_active(self) -> bool:
+        """Time-based safety stop (see OTHER_ROBOT_SIGHT_STOP_DELAY_S above):
+        independent of distance - the instant another robot's marker is seen
+        anywhere in the forward bearing cone, driving is allowed for at most
+        OTHER_ROBOT_SIGHT_STOP_DELAY_S more seconds, then this returns True and
+        keeps returning True for OTHER_ROBOT_SIGHT_HOLD_S regardless of what the
+        marker does meanwhile (latched sighting via _nearest_robot_ahead, so a
+        brief flicker doesn't reset the 1s clock either)."""
+        now = time.time()
+        if self._sight_hold_until is not None:
+            if now < self._sight_hold_until:
+                return True
+            self._sight_hold_until = None
+            self._other_seen_since = None
+
+        hit = self._nearest_robot_ahead(self.other_robot_markers, "sighting")
+        seen_now = hit is not None and abs(hit[1]) <= OTHER_ROBOT_AHEAD_BEARING
+        if not seen_now:
+            self._other_seen_since = None
+            return False
+
+        if self._other_seen_since is None:
+            self._other_seen_since = now
+            return False
+
+        if now - self._other_seen_since >= OTHER_ROBOT_SIGHT_STOP_DELAY_S:
+            self._sight_hold_until = now + OTHER_ROBOT_SIGHT_HOLD_S
+            return True
+        return False
 
     def _forward_cell_blocked(self) -> bool:
         """A HIGHER-priority robot occupies the cell I'd enter by going straight."""
         if self.my_priority == 0:
             return False
-        hit = self._nearest_robot_ahead(self.higher_priority_markers)
+        hit = self._nearest_robot_ahead(self.higher_priority_markers, "forward")
         return (hit is not None
                 and hit[0] <= OTHER_ROBOT_BLOCK_DISTANCE_M
                 and abs(hit[1]) <= OTHER_ROBOT_AHEAD_BEARING)
@@ -808,20 +885,28 @@ class ArtProject:
                 # Symmetric (ignores priority) - just don't hit each other. Only
                 # while driving forward in a corridor; the short in-place TURNING
                 # states are left alone so the psi PI controller isn't disturbed.
+                # Two independent triggers, either one stops us:
+                #   - distance: within OTHER_ROBOT_EMERGENCY_DISTANCE_M right now
+                #   - sighting: seen at ALL for OTHER_ROBOT_SIGHT_STOP_DELAY_S, then
+                #     held for OTHER_ROBOT_SIGHT_HOLD_S (see _sighting_hold_active) -
+                #     the distance check alone fires too late (camera/processing lag
+                #     + momentum already closes the gap by the time it trips).
                 if self.state in ("FOLLOWING", "METRONOME", "ADVANCING_TO_TURN",
-                                  "ADVANCING_FROM_TURN") \
-                        and self._robot_emergency_ahead():
-                    frodo.control.setTrackSpeed(0.0, 0.0)
-                    cv2.putText(display_frame, "ROBOT AHEAD - HOLDING", (30, 150),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-                    if time.time() - last_robot_hold_log > 1.0:
-                        last_robot_hold_log = time.time()
-                        print(f"[{last_robot_hold_log:.1f}] EMERGENCY HOLD - robot within "
-                              f"{OTHER_ROBOT_EMERGENCY_DISTANCE_M} m ahead")
-                    with self._stream_frame_lock:
-                        self.frame_out = display_frame
-                    time.sleep(0.05)
-                    continue
+                                  "ADVANCING_FROM_TURN"):
+                    _emergency_hit = self._robot_emergency_ahead()
+                    _sighting_hit = self._sighting_hold_active()
+                    if _emergency_hit or _sighting_hit:
+                        frodo.control.setTrackSpeed(0.0, 0.0)
+                        cv2.putText(display_frame, "ROBOT AHEAD - HOLDING", (30, 150),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                        if time.time() - last_robot_hold_log > 1.0:
+                            last_robot_hold_log = time.time()
+                            _reason = "distance" if _emergency_hit else "sighting-hold"
+                            print(f"[{last_robot_hold_log:.1f}] EMERGENCY HOLD ({_reason})")
+                        with self._stream_frame_lock:
+                            self.frame_out = display_frame
+                        time.sleep(0.05)
+                        continue
 
                 # ================= ARUCO DETECTION =================
                 # The camera can be configured for a gray output (image_format="gray"
