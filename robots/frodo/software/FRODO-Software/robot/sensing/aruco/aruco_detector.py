@@ -93,6 +93,7 @@ class ArucoDetector:
             run_in_thread: bool = True,
             Ts: float = 0.1,
             allowed_marker_ids: list | None = None,
+            marker_size_overrides: dict | None = None,
     ):
         self.Ts = Ts
         self.camera = camera
@@ -102,6 +103,17 @@ class ArucoDetector:
 
         # ArUco setup
         self.marker_size = float(marker_size)
+        # Per-ID physical size overrides (marker_id -> side length, meters).
+        # estimatePoseSingleMarkers assumes every marker in a batch is the same
+        # real-world size; an ID not actually that size gets a systematically
+        # wrong distance (e.g. a marker physically HALF self.marker_size reads
+        # as roughly TWICE as far away as it really is). Any ID not in this
+        # dict falls back to self.marker_size - existing callers that don't
+        # pass this are unaffected.
+        self.marker_size_overrides = (
+            {int(k): float(v) for k, v in marker_size_overrides.items()}
+            if marker_size_overrides else {}
+        )
         self.dictionary = arc.getPredefinedDictionary(aruco_dict)
 
         self.detector_params = arc.DetectorParameters()
@@ -300,19 +312,35 @@ class ArucoDetector:
                 marker_corners = [c for c, keep in zip(marker_corners, mask) if keep]
 
             arc.drawDetectedMarkers(frame, marker_corners, marker_ids)
-            rvecs, tvecs, _objpts = cv2.aruco.estimatePoseSingleMarkers(
-                marker_corners,
-                self.marker_size,
-                self.calibration_data.camera_matrix,
-                self.calibration_data.dist_coeff,
+
+            # estimatePoseSingleMarkers assumes ONE real-world size for the whole
+            # batch it's given, so markers with a size override (self.marker_size_
+            # overrides, e.g. smaller robot BODY markers mixed in with larger floor
+            # markers) must be pose-estimated in their own separate batch, at their
+            # own real size, or their computed distance comes out systematically
+            # wrong (see the constructor comment on marker_size_overrides).
+            ids_flat = marker_ids.flatten()
+            effective_sizes = np.array(
+                [self.marker_size_overrides.get(int(mid), self.marker_size) for mid in ids_flat]
             )
-            rvecs = np.squeeze(rvecs, axis=1)
-            tvecs = np.squeeze(tvecs, axis=1)
-            for i, marker_id in enumerate(marker_ids):
-                rvec = rvecs[i]
-                tvec = tvecs[i]
-                distance = float(np.linalg.norm(tvec))
-                self.measurements.append(ArucoMeasurement(int(marker_id[0]), rvec, tvec, distance))
+            for size in np.unique(effective_sizes):
+                group_mask = effective_sizes == size
+                group_ids = marker_ids[group_mask].reshape(-1, 1)
+                group_corners = [c for c, keep in zip(marker_corners, group_mask) if keep]
+
+                rvecs, tvecs, _objpts = cv2.aruco.estimatePoseSingleMarkers(
+                    group_corners,
+                    float(size),
+                    self.calibration_data.camera_matrix,
+                    self.calibration_data.dist_coeff,
+                )
+                rvecs = np.squeeze(rvecs, axis=1)
+                tvecs = np.squeeze(tvecs, axis=1)
+                for i, marker_id in enumerate(group_ids):
+                    rvec = rvecs[i]
+                    tvec = tvecs[i]
+                    distance = float(np.linalg.norm(tvec))
+                    self.measurements.append(ArucoMeasurement(int(marker_id[0]), rvec, tvec, distance))
         return frame
 
     # ------------------------------------------------------------------------------------------------------------------

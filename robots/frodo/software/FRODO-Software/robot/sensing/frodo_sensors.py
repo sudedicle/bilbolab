@@ -13,7 +13,7 @@ from core.utils.exit import register_exit_callback
 from core.utils.logging_utils import Logger
 from core.utils.time import TimeoutTimer
 from robot.common import FRODO_Common, ErrorSeverity
-from robot.definitions import get_all_aruco_ids
+from robot.definitions import get_all_aruco_ids, get_aruco_marker_size_overrides
 from robot.sensing.aruco.aruco_detector import ArucoDetector, ArucoDetectorStatus
 from robot.sensing.camera.pycamera import PyCamera
 from robot.sensing.measurement_model import measurement_model_from_file
@@ -95,6 +95,7 @@ class FRODO_Sensors:
             aruco_dict=self.settings.aruco.dictionary,
             marker_size=self.settings.aruco.marker_size,
             allowed_marker_ids=all_marker_ids,
+            marker_size_overrides=get_aruco_marker_size_overrides(),
         )
 
         self.aruco_measurements = []
@@ -176,8 +177,20 @@ class FRODO_Sensors:
             axis = qmt.quatAxis(q_CE_ME).squeeze()
             angle = qmt.quatAngle(q_CE_ME)
 
-            # Check if the axis is mostly around the z-axis
-            if not is_mostly_z_axis(axis):
+            # Check if the axis is mostly around the z-axis. This is a sanity
+            # gate on PSI reliability only - it assumes a marker lying flat
+            # (floor/static markers), so it systematically fails art_project's
+            # BODY markers (995-998), which are mounted upright on a robot's
+            # front/back face at camera height, a different geometry this
+            # convention was never calibrated for (confirmed in the field:
+            # every single body-marker reading was rejected here, axis e.g.
+            # [-0.30, -0.07, 0.95], never close to passing). art_project's own
+            # collision avoidance (_nearest_robot_ahead in art_project_frodo.py)
+            # only ever reads `position`, never `psi`, for these IDs - so an
+            # unreliable psi is fine to keep; dropping the position along with
+            # it just blinds the reactive collision avoidance entirely.
+            _is_body_marker = measurement.marker_id in (995, 996, 997, 998)
+            if not is_mostly_z_axis(axis) and not _is_body_marker:
                 self.logger.debug(f"Aruco Measurement not mostly around z-axis: {measurement}")
                 continue
 

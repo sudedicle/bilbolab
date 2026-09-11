@@ -505,10 +505,32 @@ def get_all_aruco_ids() -> List[int]:
     # 996 (back), frodo4 wears 997 / 998. art_project's reactive collision
     # avoidance reads frodo.sensors' aruco_measurements, so these IDs must
     # survive the detector allowlist or _nearest_robot_ahead() sees nothing.
-    ids.extend([995, 996, 997, 998])
+    ids.extend(ART_PROJECT_BODY_MARKER_IDS)
 
     # Deduplicate and sort for stability
     return sorted(set(ids))
+
+
+# art_project robot BODY markers are printed much smaller (4cm side) than the
+# floor/static markers ArucoDetector otherwise assumes (see ARUCO_SETTINGS_*
+# below, marker_size=0.08 = 8cm). estimatePoseSingleMarkers assumes one real-
+# world size per batch, so without a size override a 4cm body marker gets pose-
+# estimated as if it were 8cm - the computed distance comes out ~2x the true
+# distance (a marker physically half the assumed size reads as roughly twice
+# as far away), which silently defeats art_project's distance-threshold
+# collision avoidance (_nearest_robot_ahead in art_project_frodo.py) - it never
+# sees the other robot as close as it actually is. See
+# ArucoDetector.marker_size_overrides / FRODO_Sensors.
+ART_PROJECT_BODY_MARKER_IDS = (995, 996, 997, 998)
+ART_PROJECT_BODY_MARKER_SIZE_M = 0.04
+
+
+def get_aruco_marker_size_overrides() -> Dict[int, float]:
+    """marker_id -> real physical side length (m) for IDs whose size differs
+    from the global default (ARUCO_SETTINGS_*.marker_size / STATIC marker
+    size) - currently just the art_project body markers. Passed straight
+    through to ArucoDetector(marker_size_overrides=...) by FRODO_Sensors."""
+    return {mid: ART_PROJECT_BODY_MARKER_SIZE_M for mid in ART_PROJECT_BODY_MARKER_IDS}
 
 
 # ======================================================================================================================

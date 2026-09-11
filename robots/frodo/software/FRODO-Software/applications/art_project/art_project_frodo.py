@@ -267,17 +267,25 @@ def world_to_grid_node(x: float, y: float) -> tuple[int, int]:
     return col, row
 
 
-# frodo1 wears 995 (front) + 996
-# (back), frodo4 wears 997 (front) + 998 (back).
+# frodo1 wears 995 (front) + 996 (back), frodo4 wears 997 (front) + 998 (back).
+# The FRONT face is used separately (see higher_priority_front_markers below):
+# a HIGHER-priority robot facing us means oncoming/crossing traffic and gets a
+# full priority-gated stop-and-wait (_sighting_hold_active). Either face, from
+# ANY robot, also feeds the priority-independent proximity brake
+# (_proximity_speed_cap) so nobody - priority-privileged or not - drives
+# straight into whatever's physically ahead of them.
 ROBOT_BODY_MARKERS = {
-    "frodo1": {995, 996},
-    "frodo4": {997, 998},
+    "frodo1": {"front": 995, "back": 996},
+    "frodo4": {"front": 997, "back": 998},
 }
-# Right-of-way: earlier = higher priority. A higher-priority robot ignores the
-# others and drives its own shortest path. A lower-priority robot, when it sees
-# a higher-priority robot occupying the cell straight ahead at an intersection,
-# re-routes around it (shortest path with that cell removed). The symmetric
-# EMERGENCY stop below still applies to every robot regardless of priority.
+# Right-of-way: earlier = higher priority. It only governs who does a full
+# stop-and-wait when two robots are actively contesting the same crossing
+# (_sighting_hold_active - a higher-priority robot never yields this way to a
+# lower-priority one). Everything else is priority-blind: ANY robot occupying
+# the cell straight ahead gets routed around (_forward_cell_blocked - shortest
+# path with that cell removed, regardless of whose marker it is), and the
+# EMERGENCY stop / proximity brake below apply to every robot the same way -
+# a robot sitting in your path is an obstacle to avoid no matter its rank.
 ROBOT_PRIORITY = ["frodo1", "frodo2", "frodo3", "frodo4"]
 
 # Field-testing target node per robot, used when no go_to_position() has arrived
@@ -286,8 +294,8 @@ ROBOT_PRIORITY = ["frodo1", "frodo2", "frodo3", "frodo4"]
 # (col, row); CITY_MAP id = row * GRID_COLS + col.  Edit freely per test.
 # 2026-09-08: metronome at marker id 9 = (0,1) for frodo1, id 28 = (1,3) for frodo4.
 TEST_TARGET_BY_ROBOT = {
-    "frodo1": (3, 3),   # CITY_MAP id
-    "frodo4": (4, 1),   # CITY_MAP id 38
+    "frodo1": (7, 0),   # CITY_MAP id
+    "frodo4": (3, 0),   # CITY_MAP id 38
 }
 
 # Another robot seen closer than *_BLOCK_DISTANCE_M and within +-*_AHEAD_BEARING
@@ -321,6 +329,27 @@ OTHER_ROBOT_LAST_SEEN_GRACE_S = 3.0
 # and hold it, regardless of what the marker does meanwhile.
 OTHER_ROBOT_SIGHT_STOP_DELAY_S = 1.0   # keep driving at most this long after first sighting
 OTHER_ROBOT_SIGHT_HOLD_S = 4.0         # then hold stopped this long before re-evaluating
+# NOTE: the sighting-hold above is now keyed to a HIGHER-priority robot's
+# FRONT marker only (an oncoming/crossing robot) - see _sighting_hold_active()
+# and higher_priority_front_markers below.
+
+# --- PROXIMITY GOVERNOR (any other robot's marker ahead, ANY face, ANY priority) ---
+# The priority-gated sighting-hold above only protects a LOWER-priority robot
+# (it stops for a higher-priority one) - a higher-priority robot deliberately
+# does NOT hold/yield (see the comment on higher_priority_front_markers below),
+# so on its own it would drive at full base_speed right up to the abrupt
+# OTHER_ROBOT_EMERGENCY_DISTANCE_M stop - too late given camera/processing lag
+# + momentum (same problem the sighting-hold was built to fix, just now
+# unprotected again for the robot that never yields). Observed in the field:
+# frodo1 (priority 0, never yields) drove straight into a stationary frodo4
+# that was correctly waiting on frodo1's own path ahead of frodo1's turn.
+# Fix: a smooth, continuously-recomputed (no timer, so it can't fall out of
+# sync and burst back to full speed like a hold-then-resume would) proportional
+# brake against the CLOSEST other robot marker of any face/priority. Linear
+# ramp: at/inside the stop gap -> 0 speed, at/beyond the full-speed gap ->
+# uncapped, linear in between. See _proximity_speed_cap().
+PROXIMITY_STOP_GAP_M = 0.10        # desired minimum gap to any other robot's marker
+PROXIMITY_FULL_SPEED_GAP_M = 0.35  # at/beyond this gap, no speed cap at all
 
 
 # =====================================================================================
@@ -413,15 +442,35 @@ class ArtProject:
             self.my_priority = ROBOT_PRIORITY.index(my_id)
         except ValueError:
             self.my_priority = len(ROBOT_PRIORITY)      # unknown host -> lowest priority
-        # marker IDs of robots that outrank me -> I route around / yield to these
-        self.higher_priority_markers = set()
+        # marker IDs of robots that outrank me -> I route around / yield to these.
+        # FRONT face only, split out separately: it means that robot is facing
+        # me (oncoming/crossing) -> I do a full priority-gated stop-and-wait
+        # (_sighting_hold_active). A HIGHER-priority robot never yields this way
+        # to a LOWER-priority one - "a higher-priority robot ignores the others
+        # and drives its own shortest path" (see the ROBOT_PRIORITY comment
+        # above) - otherwise, if both robots are the same kind of blocked-by-
+        # the-other, BOTH stop together, BOTH resume together after the same
+        # hold, and are still on a collision course with nothing having
+        # actually yielded (observed in the field: frodo1 and frodo4 driving
+        # straight at each other both paused 4s and then drove into each other
+        # anyway - priority is what's supposed to break that symmetry, so only
+        # the LOWER-priority robot may honor this). The higher-priority robot's
+        # own protection against actually hitting something is the priority-
+        # independent _proximity_speed_cap() below instead.
+        self.higher_priority_front_markers = set()
         for other_id in ROBOT_PRIORITY[:self.my_priority]:
-            self.higher_priority_markers |= ROBOT_BODY_MARKERS.get(other_id, set())
-        # every other robot's markers -> used by the symmetric emergency stop
+            faces = ROBOT_BODY_MARKERS.get(other_id, {})
+            if "front" in faces:
+                self.higher_priority_front_markers.add(faces["front"])
+        # every other robot's markers (both faces, any priority) -> the
+        # symmetric distance emergency stop AND the proximity speed governor -
+        # neither is priority-gated, both are last-resort "just don't hit it"
+        # protection against actual contact (see the EMERGENCY STOP comment
+        # and _proximity_speed_cap() below).
         self.other_robot_markers = set()
-        for other_id, markers in ROBOT_BODY_MARKERS.items():
+        for other_id, faces in ROBOT_BODY_MARKERS.items():
             if other_id != my_id:
-                self.other_robot_markers |= markers
+                self.other_robot_markers |= set(faces.values())
         # latch_key -> (last_seen_time, dist_m, bearing_rad) - see
         # OTHER_ROBOT_LAST_SEEN_GRACE_S / _nearest_robot_ahead()
         self._last_robot_seen = {}
@@ -431,7 +480,8 @@ class ArtProject:
         self._sight_hold_until = None
         frodo.logger.info(
             f"Collision avoidance: id={my_id!r} priority={self.my_priority} "
-            f"route-around={sorted(self.higher_priority_markers)}")
+            f"stop-for(front)={sorted(self.higher_priority_front_markers)} "
+            f"route-around/brake-for(any)={sorted(self.other_robot_markers)}")
 
         # Approach B (see the big comment above CITY_MAP) - opened in run() once the
         # robot's WiFi IP is known; stays None (and _cooperative_next_step() then
@@ -609,12 +659,18 @@ class ArtProject:
 
     def _sighting_hold_active(self) -> bool:
         """Time-based safety stop (see OTHER_ROBOT_SIGHT_STOP_DELAY_S above):
-        independent of distance - the instant another robot's marker is seen
-        anywhere in the forward bearing cone, driving is allowed for at most
+        independent of distance - the instant a HIGHER-priority robot's FRONT
+        marker (it's facing us: oncoming / crossing our path) is seen anywhere
+        in the forward bearing cone, driving is allowed for at most
         OTHER_ROBOT_SIGHT_STOP_DELAY_S more seconds, then this returns True and
         keeps returning True for OTHER_ROBOT_SIGHT_HOLD_S regardless of what the
         marker does meanwhile (latched sighting via _nearest_robot_ahead, so a
-        brief flicker doesn't reset the 1s clock either)."""
+        brief flicker doesn't reset the 1s clock either). Priority-gated (only
+        higher_priority_front_markers, never a same/lower-priority robot's) so
+        two robots facing each other don't BOTH pause and BOTH resume in lock-
+        step with neither having yielded - the higher-priority one just keeps
+        going (protected instead by the priority-independent
+        _proximity_speed_cap()). A BACK marker never triggers this either way."""
         now = time.time()
         if self._sight_hold_until is not None:
             if now < self._sight_hold_until:
@@ -622,7 +678,7 @@ class ArtProject:
             self._sight_hold_until = None
             self._other_seen_since = None
 
-        hit = self._nearest_robot_ahead(self.other_robot_markers, "sighting")
+        hit = self._nearest_robot_ahead(self.higher_priority_front_markers, "sighting")
         seen_now = hit is not None and abs(hit[1]) <= OTHER_ROBOT_AHEAD_BEARING
         if not seen_now:
             self._other_seen_since = None
@@ -638,13 +694,45 @@ class ArtProject:
         return False
 
     def _forward_cell_blocked(self) -> bool:
-        """A HIGHER-priority robot occupies the cell I'd enter by going straight."""
-        if self.my_priority == 0:
-            return False
-        hit = self._nearest_robot_ahead(self.higher_priority_markers, "forward")
+        """Some other robot (ANY priority) occupies the cell I'd enter by going
+        straight. NOT priority-gated: priority decides who yields/stops when
+        two robots are actively contesting the same cell/intersection (see
+        _sighting_hold_active), but a robot sitting still in my literal path is
+        an obstacle regardless of rank - even the top-priority robot has to
+        route around it or it just sits there forever creeping to a stop via
+        _proximity_speed_cap and never reaching its target (observed in the
+        field: frodo1, priority 0, driving straight through frodo4 parked
+        directly on frodo1's leg - frodo1 needs to detour, not just slow down
+        and wait)."""
+        hit = self._nearest_robot_ahead(self.other_robot_markers, "forward")
         return (hit is not None
                 and hit[0] <= OTHER_ROBOT_BLOCK_DISTANCE_M
                 and abs(hit[1]) <= OTHER_ROBOT_AHEAD_BEARING)
+
+    def _proximity_speed_cap(self, desired_speed: float):
+        """Smooth, priority-INDEPENDENT braking against the closest other
+        robot's marker (any face, any priority) - see the PROXIMITY GOVERNOR
+        comment above PROXIMITY_STOP_GAP_M. This is what protects a HIGHER-
+        priority robot (which never engages _sighting_hold_active/stops for a
+        lower-priority one) from driving straight into one sitting in its path
+        - e.g. frodo4 correctly waiting somewhere on frodo1's straight leg,
+        before frodo1's own turn. Unlike the hold, there's no timer here: the
+        cap is recomputed fresh every frame from the live distance, so it
+        can't fall out of sync and burst back to full speed the way a fixed-
+        duration hold could. Linear ramp: at/inside PROXIMITY_STOP_GAP_M -> 0,
+        at/beyond PROXIMITY_FULL_SPEED_GAP_M -> uncapped. Returns
+        `desired_speed` unmodified if no other robot marker is (or was
+        recently, via the _nearest_robot_ahead latch) seen ahead."""
+        hit = self._nearest_robot_ahead(self.other_robot_markers, "proximity")
+        if hit is None or abs(hit[1]) > OTHER_ROBOT_AHEAD_BEARING:
+            return desired_speed
+        dist = hit[0]
+        if dist <= PROXIMITY_STOP_GAP_M:
+            return 0.0
+        if dist >= PROXIMITY_FULL_SPEED_GAP_M:
+            return desired_speed
+        frac = (dist - PROXIMITY_STOP_GAP_M) / (PROXIMITY_FULL_SPEED_GAP_M - PROXIMITY_STOP_GAP_M)
+        return desired_speed * frac
 
     # ------------------------------------------------------------------------------------------------------------------
     def _cooperative_next_step(self, current_coord, target_node):
@@ -816,6 +904,7 @@ class ArtProject:
         shape_printed = False
         last_aruco_log = 0.0
         last_robot_hold_log = 0.0
+        last_robot_sensor_log = 0.0
 
         try:
             while True:
@@ -880,6 +969,40 @@ class ArtProject:
                     with self._stream_frame_lock:
                         self.frame_out = display_frame
                     break
+
+                # ---------------- DEBUG: raw frodo.sensors body-marker readings ----------------
+                # All the collision-avoidance checks below (_robot_emergency_ahead,
+                # _sighting_hold_active, _forward_cell_blocked, _proximity_speed_cap)
+                # read frodo.sensors.getSample().aruco_measurements, NOT the
+                # detected_markers/console prints from the local self.aruco_detector
+                # further down - those are two independent detection pipelines on two
+                # different cv2.aruco.ArucoDetector instances. A robot can be clearly
+                # visible in the "ArUco NNN ... TOO FAR/NOT ON MAP" floor-marker prints
+                # while frodo.sensors reports nothing for it at all (allowlist gap,
+                # is_mostly_z_axis() rejecting the pose, marker_size mismatch skewing
+                # the computed distance, ...) - print what THIS pipeline actually sees
+                # for other robots' body markers so a collision can be diagnosed
+                # instead of guessed at.
+                _dbg_now = time.time()
+                if _dbg_now - last_robot_sensor_log > 0.5:
+                    last_robot_sensor_log = _dbg_now
+                    try:
+                        _dbg_sample = self.frodo.sensors.getSample()
+                    except Exception as _dbg_e:
+                        print(f"[{_dbg_now:.1f}] sensors.getSample() FAILED: {_dbg_e}")
+                        _dbg_sample = None
+                    if _dbg_sample is not None:
+                        _dbg_hits = [m for m in _dbg_sample.aruco_measurements
+                                     if m.measured_aruco_id in self.other_robot_markers]
+                        if _dbg_hits:
+                            for m in _dbg_hits:
+                                fwd, left = float(m.position[0]), float(m.position[1])
+                                print(f"[{_dbg_now:.1f}] SENSOR body-marker {m.measured_aruco_id}: "
+                                      f"fwd={fwd:+.2f}m left={left:+.2f}m "
+                                      f"dist={float(np.hypot(fwd, left)):.2f}m")
+                        else:
+                            print(f"[{_dbg_now:.1f}] SENSOR body-marker: none in "
+                                  f"aruco_measurements (watching for {sorted(self.other_robot_markers)})")
 
                 # ---------------- EMERGENCY STOP (another robot dead ahead) ----------------
                 # Symmetric (ignores priority) - just don't hit each other. Only
@@ -1084,15 +1207,19 @@ class ArtProject:
                     # until in line with the target, then turn ONCE onto the other
                     # axis (grid_nav.next_heading). No cooperative A* / peer planning
                     # any more - the path is deterministic. The only reroute is the
-                    # reactive camera one: if a HIGHER-priority robot's body marker is
-                    # sitting in the cell straight ahead, drop that cell so BFS finds
-                    # a detour (the symmetric EMERGENCY stop still guards contact).
+                    # reactive camera one: if ANY other robot's body marker (any
+                    # priority) is sitting in the cell straight ahead, drop that cell
+                    # so BFS finds a detour (the symmetric EMERGENCY stop and
+                    # _proximity_speed_cap still guard against actual contact). Not
+                    # priority-gated - a robot blocking my literal path is an obstacle
+                    # to route around regardless of rank, even for the top-priority
+                    # robot (which otherwise never yields to anyone).
                     blocked_cells = set()
                     if self._forward_cell_blocked():
                         step = DIRECTIONS.get(ROBOT_HEADING, (0, 0))
                         ahead_cell = (current_coord[0] + step[0], current_coord[1] + step[1])
                         blocked_cells.add(ahead_cell)
-                        print(f"  [avoidance] higher-priority robot ahead - routing around {ahead_cell}")
+                        print(f"  [avoidance] robot ahead - routing around {ahead_cell}")
 
                     desired_heading = next_heading(current_coord, target_node, GRID_NODES,
                                                    blocked=blocked_cells, prefer=ROBOT_HEADING)
@@ -1263,6 +1390,11 @@ class ArtProject:
                     # the metronome runs while moving (SERVO_OPEN_DRIVE_TIME), then
                     # close the servo + stop + DONE.
                     follow_speed = (base_speed * 0.5) if self.state == "METRONOME" else base_speed
+                    # Smooth, priority-independent brake against whatever robot
+                    # marker is closest ahead - catches what the priority-gated
+                    # sighting-hold above deliberately leaves unguarded (a
+                    # higher-priority robot approaching a lower-priority one).
+                    follow_speed = self._proximity_speed_cap(follow_speed)
 
                     if line_detected:
                         line_lost_since = None
